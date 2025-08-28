@@ -25,7 +25,7 @@ app.use(express.json()); // Enable JSON body parsing
 // --- Database Connection Configuration ---
 // The connection string is read from the environment variable.
 // This is a crucial step for production deployment on platforms like Railway.
-const neonDatabaseUrl = process.env.NEON_DATABASE_URL;
+const neonDatabaseUrl =  'postgresql://neondb_owner:npg_jgROvpDtrm03@ep-hidden-truth-aev5l7a7-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
 
 if (!neonDatabaseUrl) {
     console.error('NEON_DATABASE_URL is not set. Please set this environment variable.');
