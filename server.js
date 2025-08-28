@@ -1,117 +1,84 @@
 /**
- * @file server.js
- * @description This file sets up a Node.js server with Express to handle API requests
- * and connect to a Neon PostgreSQL database.
+ * Main server file for the Node.js backend.
+ * This server uses Express to handle API requests and 'pg' to connect to a PostgreSQL database.
+ * The database connection URL is pulled from the environment variables for security.
  */
 
-// Import necessary libraries
-const express = require('express');
-const cors = require('cors');
-const { Pool } = require('pg');
-const dotenv = require('dotenv');
-
-// Load environment variables from the .env file
-dotenv.config();
-
-// Initialize the Express application
-const app = express();
-
-// Set the port, using the environment variable or defaulting to 5000
-const port = process.env.PORT || 5000;
-
-// Middleware setup
-// Use CORS to allow requests from your React frontend
-app.use(cors());
-// Use express.json() to parse incoming JSON requests
-app.use(express.json());
-
-// Check if the Neon database URL is set
-if (!process.env.NEON_DATABASE_URL) {
-  console.error('Error: NEON_DATABASE_URL not found in .env file.');
-  process.exit(1);
+// Load environment variables in development mode only
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config();
 }
 
-// Create a new PostgreSQL client pool using the Neon database URL
+// Import necessary modules
+const express = require('express');
+const { Pool } = require('pg');
+const cors = require('cors');
+
+// Initialize Express app
+const app = express();
+const port = process.env.PORT || 3000;
+
+// Middleware setup
+app.use(cors()); // Enable CORS for cross-origin requests
+app.use(express.json()); // Enable JSON body parsing
+
+// --- Database Connection Configuration ---
+// The connection string is read from the environment variable.
+// This is a crucial step for production deployment on platforms like Railway.
+const neonDatabaseUrl = process.env.NEON_DATABASE_URL;
+
+if (!neonDatabaseUrl) {
+    console.error('NEON_DATABASE_URL is not set. Please set this environment variable.');
+    process.exit(1); // Exit if the database URL is not configured
+}
+
 const pool = new Pool({
-  connectionString: process.env.NEON_DATABASE_URL,
-  ssl: {
-    // Required for secure connections to Neon, which enforces SSL
-    rejectUnauthorized: false
-  }
+    connectionString: neonDatabaseUrl,
 });
 
 /**
- * @route GET /api/test
- * @description A simple test route to check if the server is running and the database connection is working.
- * This query fetches the current database timestamp.
+ * Test database connection.
+ * This is a simple function to check if the database is reachable.
  */
-app.get('/api/test', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT NOW()');
-    res.status(200).json({
-      message: 'Server is running and connected to the database!',
-      databaseTime: result.rows[0].now,
-    });
-  } catch (err) {
-    console.error('Database connection error:', err);
-    res.status(500).json({ error: 'Database connection failed.' });
-  }
+async function testDbConnection() {
+    try {
+        await pool.query('SELECT 1 + 1 AS solution');
+        console.log('Successfully connected to the PostgreSQL database!');
+    } catch (err) {
+        console.error('Failed to connect to the database:', err.message);
+        process.exit(1);
+    }
+}
+
+testDbConnection();
+
+// --- API Endpoints ---
+
+/**
+ * Health check endpoint.
+ * Responds with a simple message to confirm the server is running.
+ */
+app.get('/', (req, res) => {
+    res.send('Backend server is running successfully!');
 });
 
 /**
- * @route GET /api/projects
- * @description Fetches a list of projects from the database.
- * This is a placeholder example. In a real-world scenario, you would
- * have a 'projects' table and query it.
- *
- * Example of a real database query:
- * `const result = await pool.query('SELECT * FROM projects ORDER BY id');`
+ * Example endpoint to fetch data from the database.
+ * This endpoint queries a 'users' table and returns the results.
+ * You can modify this to fit your portfolio's data needs.
  */
-app.get('/api/projects', async (req, res) => {
-  try {
-    // For this example, we'll return hardcoded data.
-    // In a production app, you would fetch this from your database.
-    const projects = [
-      { id: 1, title: 'Portfolio Website', description: 'Built with React and Tailwind CSS.', imageUrl: 'https://placehold.co/400x300/a855f7/ffffff?text=Project+1', link: '#' },
-      { id: 2, title: 'Data Visualization Dashboard', description: 'Interactive charts and graphs.', imageUrl: 'https://placehold.co/400x300/6366f1/ffffff?text=Project+2', link: '#' },
-    ];
-    res.status(200).json(projects);
-  } catch (err) {
-    console.error('Error fetching projects:', err);
-    res.status(500).json({ error: 'Failed to fetch projects.' });
-  }
+app.get('/api/users', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM users');
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error executing query:', err.stack);
+        res.status(500).json({ error: 'Internal server error' });
+    }
 });
 
-/**
- * @route POST /api/contact
- * @description Handles form submissions. This is a placeholder for a contact form.
- * It demonstrates how you would insert data into a 'messages' table.
- */
-app.post('/api/contact', async (req, res) => {
-  const { name, email, message } = req.body;
-  if (!name || !email || !message) {
-    return res.status(400).json({ error: 'All fields are required.' });
-  }
-
-  try {
-    // Example of inserting data into a database table
-    // await pool.query(
-    //   'INSERT INTO messages (name, email, message) VALUES ($1, $2, $3) RETURNING *',
-    //   [name, email, message]
-    // );
-    
-    // For this example, we'll just log the data received.
-    console.log('Received new contact message:', { name, email, message });
-    
-    res.status(201).json({ message: 'Message received successfully!' });
-  } catch (err) {
-    console.error('Error saving contact message:', err);
-    res.status(500).json({ error: 'Failed to send message.' });
-  }
-});
-
-// Start the server and listen on the specified port
+// Start the server
 app.listen(port, () => {
-  console.log(`Server is listening on http://localhost:${port}`);
+    console.log(`Server is running on http://localhost:${port}`);
 });
 
