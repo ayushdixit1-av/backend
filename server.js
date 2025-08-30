@@ -1,4 +1,3 @@
-require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const pg = require('pg');
@@ -9,11 +8,21 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: 'postgresql://neondb_owner:npg_jgROvpDtrm03@ep-hidden-truth-aev5l7a7-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require',
   ssl: {
-    rejectUnauthorized: false, // Required for NeonDB or Railway PostgreSQL SSL
+    rejectUnauthorized: false, // Important for NeonDB SSL connections
   },
 });
+
+async function testDBConnection() {
+  try {
+    await pool.query('SELECT NOW()');
+    console.log('Successfully connected to NeonDB PostgreSQL');
+  } catch (err) {
+    console.error('Failed to connect to NeonDB PostgreSQL:', err);
+    process.exit(1);
+  }
+}
 
 app.use(cors());
 app.use(bodyParser.json());
@@ -42,7 +51,7 @@ async function initializeDB() {
   `);
 }
 
-// Seed products (run after tables are ready)
+// Seed products data after ensuring tables exist
 async function seedProducts() {
   const products = [
     {name: 'Organic Apples', price: '$2.50/lb', image_url: 'https://placehold.co/400x300/4CAF50/ffffff?text=Apples'},
@@ -62,44 +71,44 @@ async function seedProducts() {
   }
 }
 
-// Register user
+// User registration
 app.post('/api/register', async (req, res) => {
   const { name, email, password } = req.body;
-  if(!name || !email || !password) return res.status(400).json({error: 'Name, email, and password are required.'});
+  if (!name || !email || !password) return res.status(400).json({ error: 'Name, email, and password are required.' });
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await pool.query(
       'INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email, role',
       [name, email, hashedPassword]
     );
-    res.status(201).json({message: 'User registered successfully', user: result.rows[0]});
-  } catch(err) {
-    if(err.code === '23505') {
-      res.status(409).json({error: 'Email already registered'});
+    res.status(201).json({ message: 'User registered successfully', user: result.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') {
+      res.status(409).json({ error: 'Email already registered' });
     } else {
       console.error(err);
-      res.status(500).json({error: 'Internal server error'});
+      res.status(500).json({ error: 'Internal server error' });
     }
   }
 });
 
-// Login user
+// User login
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
-  if(!email || !password) return res.status(400).json({error: 'Email and password required'});
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
   try {
     const userResult = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
-    if(userResult.rows.length === 0) return res.status(401).json({error: 'Invalid credentials'});
+    if (userResult.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
     const user = userResult.rows[0];
     const isValid = await bcrypt.compare(password, user.password_hash);
-    if(!isValid) return res.status(401).json({error: 'Invalid credentials'});
+    if (!isValid) return res.status(401).json({ error: 'Invalid credentials' });
     res.json({
       message: 'Login successful',
       user: { id: user.id, name: user.name, email: user.email, role: user.role }
     });
-  } catch(err) {
+  } catch (err) {
     console.error(err);
-    res.status(500).json({error: 'Internal server error'});
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -108,9 +117,9 @@ app.get('/api/users', async (req, res) => {
   try {
     const result = await pool.query('SELECT id, name, email FROM users ORDER BY id');
     res.json(result.rows);
-  } catch(err) {
+  } catch (err) {
     console.error(err);
-    res.status(500).json({error: 'Internal server error'});
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -119,21 +128,30 @@ app.get('/api/products', async (req, res) => {
   try {
     const result = await pool.query('SELECT id, name, price, image_url FROM products ORDER BY id');
     res.json(result.rows);
-  } catch(err) {
+  } catch (err) {
     console.error(err);
-    res.status(500).json({error: 'Internal server error'});
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 async function startServer() {
+  await testDBConnection();
+  await initializeDB();
+  await seedProducts();
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  });
+}
+
+// Test database connection
+async function testDBConnection() {
   try {
-    await initializeDB();
-    await seedProducts();
-    app.listen(port, () => console.log(`Server running on port ${port}`));
+    await pool.query('SELECT NOW()');
+    console.log('Successfully connected to NeonDB PostgreSQL');
   } catch (err) {
-    console.error('Failed to initialize database or start server', err);
+    console.error('Failed to connect to NeonDB PostgreSQL:', err);
+    process.exit(1);
   }
 }
 
 startServer();
-
