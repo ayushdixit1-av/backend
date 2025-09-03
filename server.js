@@ -1,33 +1,38 @@
-const express = require('express');
-const bodyParser = require('body-parser');
-const pg = require('pg');
-const bcrypt = require('bcrypt');
-const cors = require('cors');
+const express = require("express");
+const bodyParser = require("body-parser");
+const pg = require("pg");
+const bcrypt = require("bcrypt");
+const cors = require("cors");
+const fetch = require("node-fetch"); // required for calling Google API
 
 const app = express();
 const port = process.env.PORT || 3000;
 
+// --- PostgreSQL Pool (NeonDB) ---
 const pool = new pg.Pool({
-  connectionString: 'postgresql://neondb_owner:npg_jgROvpDtrm03@ep-hidden-truth-aev5l7a7-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require',
+  connectionString:
+    "postgresql://neondb_owner:npg_jgROvpDtrm03@ep-hidden-truth-aev5l7a7-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
   ssl: {
     rejectUnauthorized: false, // Important for NeonDB SSL connections
   },
 });
 
+// --- Middleware ---
+app.use(cors());
+app.use(bodyParser.json());
+
+// --- Test DB Connection ---
 async function testDBConnection() {
   try {
-    await pool.query('SELECT NOW()');
-    console.log('Successfully connected to NeonDB PostgreSQL');
+    await pool.query("SELECT NOW()");
+    console.log("✅ Successfully connected to NeonDB PostgreSQL");
   } catch (err) {
-    console.error('Failed to connect to NeonDB PostgreSQL:', err);
+    console.error("❌ Failed to connect to NeonDB PostgreSQL:", err);
     process.exit(1);
   }
 }
 
-app.use(cors());
-app.use(bodyParser.json());
-
-// Create tables if they don't exist
+// --- Create Tables ---
 async function initializeDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -51,107 +56,172 @@ async function initializeDB() {
   `);
 }
 
-// Seed products data after ensuring tables exist
+// --- Seed Example Products ---
 async function seedProducts() {
   const products = [
-    {name: 'Organic Apples', price: '$2.50/lb', image_url: 'https://placehold.co/400x300/4CAF50/ffffff?text=Apples'},
-    {name: 'Fresh Carrots', price: '$1.80/lb', image_url: 'https://placehold.co/400x300/FF5722/ffffff?text=Carrots'},
-    {name: 'Farm Eggs', price: '$4.00/dozen', image_url: 'https://placehold.co/400x300/FBC02D/ffffff?text=Eggs'},
-    {name: 'Local Honey', price: '$8.00/jar', image_url: 'https://placehold.co/400x300/FF9800/ffffff?text=Honey'},
-    {name: 'Red Potatoes', price: '$2.00/lb', image_url: 'https://placehold.co/400x300/BDBDBD/ffffff?text=Potatoes'},
-    {name: 'Heirloom Tomatoes', price: '$3.50/lb', image_url: 'https://placehold.co/400x300/F44336/ffffff?text=Tomatoes'},
+    {
+      name: "Organic Apples",
+      price: "$2.50/lb",
+      image_url: "https://placehold.co/400x300/4CAF50/ffffff?text=Apples",
+    },
+    {
+      name: "Fresh Carrots",
+      price: "$1.80/lb",
+      image_url: "https://placehold.co/400x300/FF5722/ffffff?text=Carrots",
+    },
+    {
+      name: "Farm Eggs",
+      price: "$4.00/dozen",
+      image_url: "https://placehold.co/400x300/FBC02D/ffffff?text=Eggs",
+    },
+    {
+      name: "Local Honey",
+      price: "$8.00/jar",
+      image_url: "https://placehold.co/400x300/FF9800/ffffff?text=Honey",
+    },
+    {
+      name: "Red Potatoes",
+      price: "$2.00/lb",
+      image_url: "https://placehold.co/400x300/BDBDBD/ffffff?text=Potatoes",
+    },
+    {
+      name: "Heirloom Tomatoes",
+      price: "$3.50/lb",
+      image_url: "https://placehold.co/400x300/F44336/ffffff?text=Tomatoes",
+    },
   ];
 
   for (const product of products) {
-    await pool.query(`
+    await pool.query(
+      `
       INSERT INTO products (name, price, image_url)
       VALUES ($1, $2, $3)
       ON CONFLICT DO NOTHING
-    `, [product.name, product.price, product.image_url]);
+    `,
+      [product.name, product.price, product.image_url]
+    );
   }
 }
 
-// User registration
-app.post('/api/register', async (req, res) => {
+// --- User Registration ---
+app.post("/api/register", async (req, res) => {
   const { name, email, password } = req.body;
-  if (!name || !email || !password) return res.status(400).json({ error: 'Name, email, and password are required.' });
+  if (!name || !email || !password)
+    return res
+      .status(400)
+      .json({ error: "Name, email, and password are required." });
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      'INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email, role',
+      "INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email, role",
       [name, email, hashedPassword]
     );
-    res.status(201).json({ message: 'User registered successfully', user: result.rows[0] });
+    res
+      .status(201)
+      .json({ message: "User registered successfully", user: result.rows[0] });
   } catch (err) {
-    if (err.code === '23505') {
-      res.status(409).json({ error: 'Email already registered' });
+    if (err.code === "23505") {
+      res.status(409).json({ error: "Email already registered" });
     } else {
       console.error(err);
-      res.status(500).json({ error: 'Internal server error' });
+      res.status(500).json({ error: "Internal server error" });
     }
   }
 });
 
-// User login
-app.post('/api/login', async (req, res) => {
+// --- User Login ---
+app.post("/api/login", async (req, res) => {
   const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  if (!email || !password)
+    return res.status(400).json({ error: "Email and password required" });
   try {
-    const userResult = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
-    if (userResult.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
+    const userResult = await pool.query(
+      "SELECT * FROM users WHERE email=$1",
+      [email]
+    );
+    if (userResult.rows.length === 0)
+      return res.status(401).json({ error: "Invalid credentials" });
     const user = userResult.rows[0];
     const isValid = await bcrypt.compare(password, user.password_hash);
-    if (!isValid) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!isValid) return res.status(401).json({ error: "Invalid credentials" });
     res.json({
-      message: 'Login successful',
-      user: { id: user.id, name: user.name, email: user.email, role: user.role }
+      message: "Login successful",
+      user: { id: user.id, name: user.name, email: user.email, role: user.role },
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// Get all users
-app.get('/api/users', async (req, res) => {
+// --- Get All Users ---
+app.get("/api/users", async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, name, email FROM users ORDER BY id');
+    const result = await pool.query(
+      "SELECT id, name, email FROM users ORDER BY id"
+    );
     res.json(result.rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// Get all products
-app.get('/api/products', async (req, res) => {
+// --- Get All Products ---
+app.get("/api/products", async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, name, price, image_url FROM products ORDER BY id');
+    const result = await pool.query(
+      "SELECT id, name, price, image_url FROM products ORDER BY id"
+    );
     res.json(result.rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
+// --- Google Cloud Text-to-Speech Proxy Endpoint ---
+app.post("/api/tts", async (req, res) => {
+  const { text, lang } = req.body;
+
+  if (!text || !lang) {
+    return res.status(400).json({ error: "Text and language are required." });
+  }
+
+  try {
+    const response = await fetch(
+      "https://texttospeech.googleapis.com/v1/text:synthesize?key=AIzaSyCJKiAz4YoRSBuVvyZa-De5iuK4ysAm1ao",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          input: { text },
+          voice: { languageCode: lang, ssmlGender: "NEUTRAL" },
+          audioConfig: { audioEncoding: "MP3" },
+        }),
+      }
+    );
+
+    const data = await response.json();
+    if (data.audioContent) {
+      res.json({ audioContent: data.audioContent });
+    } else {
+      res.status(500).json({ error: "TTS API failed", details: data });
+    }
+  } catch (err) {
+    console.error("TTS Proxy error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// --- Start Server ---
 async function startServer() {
   await testDBConnection();
   await initializeDB();
   await seedProducts();
   app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
+    console.log(`🚀 Server running on http://localhost:${port}`);
   });
-}
-
-// Test database connection
-async function testDBConnection() {
-  try {
-    await pool.query('SELECT NOW()');
-    console.log('Successfully connected to NeonDB PostgreSQL');
-  } catch (err) {
-    console.error('Failed to connect to NeonDB PostgreSQL:', err);
-    process.exit(1);
-  }
 }
 
 startServer();
