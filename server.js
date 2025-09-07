@@ -85,7 +85,7 @@ async function initializeDB() {
       "sess" json NOT NULL,
       "expire" timestamp(6) NOT NULL
     );
-    CREATE INDEX "IDX_session_expire" ON "session" ("expire");
+    CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON "session" ("expire");
   `);
 }
 
