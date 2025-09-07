@@ -3,7 +3,9 @@ const bodyParser = require("body-parser");
 const pg = require("pg");
 const bcrypt = require("bcrypt");
 const cors = require("cors");
-const fetch = require("node-fetch"); // required for calling Google API
+const path = require("path");
+const session = require('express-session');
+const pgSession = require('connect-pg-simple')(session);
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -20,6 +22,24 @@ const pool = new pg.Pool({
 // --- Middleware ---
 app.use(cors());
 app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true })); // For parsing form data
+app.use(express.static(path.join(__dirname, 'public'))); // Serve static files (if any)
+app.set('view engine', 'ejs'); // Set EJS as the templating engine
+app.set('views', __dirname); // Set the views directory to the current directory
+
+// --- Session Middleware ---
+app.use(
+  session({
+    store: new pgSession({
+      pool: pool,
+      tableName: 'session',
+    }),
+    secret: 'super_secret_key_that_should_be_in_env_file', // Replace with a strong secret
+    resave: false,
+    saveUninitialized: false,
+    cookie: { maxAge: 30 * 24 * 60 * 60 * 1000 }, // 30 days
+  })
+);
 
 // --- Test DB Connection ---
 async function testDBConnection() {
@@ -53,6 +73,17 @@ async function initializeDB() {
       image_url TEXT NOT NULL,
       created_at TIMESTAMP DEFAULT NOW()
     );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS "session" (
+      "sid" varchar NOT NULL COLLATE "default",
+      "sess" json NOT NULL,
+      "expire" timestamp(6) NOT NULL
+    )
+    WITH (OIDS=FALSE);
+    ALTER TABLE "session" ADD CONSTRAINT "session_pkey" PRIMARY KEY ("sid") NOT DEFERRABLE INITIALLY IMMEDIATE;
+    CREATE INDEX "IDX_session_expire" ON "session" ("expire");
   `);
 }
 
@@ -103,114 +134,133 @@ async function seedProducts() {
   }
 }
 
+// --- Frontend Routes ---
+app.get("/", (req, res) => {
+  if (req.session.user) {
+    if (req.session.user.role === 'farm') {
+      return res.redirect("/farm/dashboard");
+    }
+    return res.redirect("/user/dashboard");
+  }
+  res.render("login.ejs", { error: null });
+});
+
+app.get("/register", (req, res) => {
+  res.render("register.ejs", { error: null });
+});
+
+app.get("/login", (req, res) => {
+  const error = req.query.error;
+  res.render("login.ejs", { error: error ? 'Invalid credentials or email already in use.' : null });
+});
+
+app.get("/user/dashboard", async (req, res) => {
+  if (!req.session.user || req.session.user.role !== 'user') {
+    return res.redirect("/login?error=Unauthorized access");
+  }
+  try {
+    const productsResult = await pool.query("SELECT * FROM products ORDER BY id");
+    res.render("user_dashboard.ejs", { user: req.session.user, products: productsResult.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Internal server error");
+  }
+});
+
+app.get("/farm/dashboard", async (req, res) => {
+  if (!req.session.user || req.session.user.role !== 'farm') {
+    return res.redirect("/login?error=Unauthorized access");
+  }
+  try {
+    const usersResult = await pool.query("SELECT id, name, email, role FROM users ORDER BY id");
+    res.render("farm_dashboard.ejs", { user: req.session.user, users: usersResult.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Internal server error");
+  }
+});
+
+app.post("/logout", (req, res) => {
+  req.session.destroy((err) => {
+    if (err) {
+      return res.status(500).send("Could not log out.");
+    }
+    res.redirect("/login");
+  });
+});
+
 // --- User Registration ---
-app.post("/api/register", async (req, res) => {
-  const { name, email, password } = req.body;
-  if (!name || !email || !password)
-    return res
-      .status(400)
-      .json({ error: "Name, email, and password are required." });
+app.post("/register", async (req, res) => {
+  const { name, email, password, role } = req.body;
+  if (!name || !email || !password) {
+    return res.redirect("/register?error=Name, email, and password are required.");
+  }
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      "INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email, role",
-      [name, email, hashedPassword]
+      "INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING id, name, email, role",
+      [name, email, hashedPassword, role || 'user'] // default to 'user'
     );
-    res
-      .status(201)
-      .json({ message: "User registered successfully", user: result.rows[0] });
+    req.session.user = result.rows[0];
+    res.redirect("/user/dashboard");
   } catch (err) {
     if (err.code === "23505") {
-      res.status(409).json({ error: "Email already registered" });
+      return res.redirect("/register?error=Email already registered");
     } else {
       console.error(err);
-      res.status(500).json({ error: "Internal server error" });
+      res.redirect("/register?error=Internal server error");
     }
   }
 });
 
 // --- User Login ---
-app.post("/api/login", async (req, res) => {
+app.post("/login", async (req, res) => {
   const { email, password } = req.body;
-  if (!email || !password)
-    return res.status(400).json({ error: "Email and password required" });
+  if (!email || !password) {
+    return res.redirect("/login?error=Email and password required");
+  }
   try {
-    const userResult = await pool.query(
-      "SELECT * FROM users WHERE email=$1",
-      [email]
-    );
-    if (userResult.rows.length === 0)
-      return res.status(401).json({ error: "Invalid credentials" });
+    const userResult = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
+    if (userResult.rows.length === 0) {
+      return res.redirect("/login?error=Invalid credentials");
+    }
     const user = userResult.rows[0];
     const isValid = await bcrypt.compare(password, user.password_hash);
-    if (!isValid) return res.status(401).json({ error: "Invalid credentials" });
-    res.json({
-      message: "Login successful",
-      user: { id: user.id, name: user.name, email: user.email, role: user.role },
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
+    if (!isValid) {
+      return res.redirect("/login?error=Invalid credentials");
+    }
 
-// --- Get All Users ---
-app.get("/api/users", async (req, res) => {
-  try {
-    const result = await pool.query(
-      "SELECT id, name, email FROM users ORDER BY id"
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
+    req.session.user = { id: user.id, name: user.name, email: user.email, role: user.role };
 
-// --- Get All Products ---
-app.get("/api/products", async (req, res) => {
-  try {
-    const result = await pool.query(
-      "SELECT id, name, price, image_url FROM products ORDER BY id"
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// --- Google Cloud Text-to-Speech Proxy Endpoint ---
-app.post("/api/tts", async (req, res) => {
-  const { text, lang } = req.body;
-
-  if (!text || !lang) {
-    return res.status(400).json({ error: "Text and language are required." });
-  }
-
-  try {
-    const response = await fetch(
-      "https://texttospeech.googleapis.com/v1/text:synthesize?key=AIzaSyCJKiAz4YoRSBuVvyZa-De5iuK4ysAm1ao",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          input: { text },
-          voice: { languageCode: lang, ssmlGender: "NEUTRAL" },
-          audioConfig: { audioEncoding: "MP3" },
-        }),
-      }
-    );
-
-    const data = await response.json();
-    if (data.audioContent) {
-      res.json({ audioContent: data.audioContent });
+    if (user.role === 'farm') {
+      res.redirect("/farm/dashboard");
     } else {
-      res.status(500).json({ error: "TTS API failed", details: data });
+      res.redirect("/user/dashboard");
     }
   } catch (err) {
-    console.error("TTS Proxy error:", err);
-    res.status(500).json({ error: "Internal server error" });
+    console.error(err);
+    res.redirect("/login?error=Internal server error");
+  }
+});
+
+// --- Add New Product (Farm-only) ---
+app.post("/add-product", async (req, res) => {
+  if (!req.session.user || req.session.user.role !== 'farm') {
+    return res.status(403).send("Unauthorized");
+  }
+  const { name, price, image_url } = req.body;
+  if (!name || !price || !image_url) {
+    return res.status(400).send("Name, price, and image URL are required.");
+  }
+  try {
+    await pool.query(
+      "INSERT INTO products (name, price, image_url) VALUES ($1, $2, $3)",
+      [name, price, image_url]
+    );
+    res.redirect("/farm/dashboard");
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Internal server error");
   }
 });
 
