@@ -11,11 +11,11 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // --- PostgreSQL Pool (NeonDB) ---
+// The connection string is now hardcoded as per your request.
 const pool = new pg.Pool({
-  connectionString:
-    "postgresql://neondb_owner:npg_jgROvpDtrm03@ep-hidden-truth-aev5l7a7-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
+  connectionString: "postgresql://neondb_owner:npg_jgROvpDtrm03@ep-hidden-truth-aev5l7a7-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
   ssl: {
-    rejectUnauthorized: false, // Important for NeonDB SSL connections
+    rejectUnauthorized: false, // Required for NeonDB SSL connections
   },
 });
 
@@ -23,18 +23,22 @@ const pool = new pg.Pool({
 app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true })); // For parsing form data
-app.use(express.static(path.join(__dirname, 'public'))); // Serve static files (if any)
+
+// Corrected the path to the 'views' directory to fix the "lookup view" error.
+app.set('views', path.join(__dirname, 'views'));
 app.set('view engine', 'ejs'); // Set EJS as the templating engine
-app.set('views', __dirname); // Set the views directory to the current directory
+
+app.use(express.static(path.join(__dirname, 'public'))); // Serve static files (if any)
 
 // --- Session Middleware ---
+// The session secret is now hardcoded as per your request.
 app.use(
   session({
     store: new pgSession({
       pool: pool,
       tableName: 'session',
     }),
-    secret: 'super_secret_key_that_should_be_in_env_file', // Replace with a strong secret
+    secret: 'super_secret_key_that_should_be_in_env_file', // Hardcoded secret
     resave: false,
     saveUninitialized: false,
     cookie: { maxAge: 30 * 24 * 60 * 60 * 1000 }, // 30 days
