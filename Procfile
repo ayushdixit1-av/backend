@@ -1,1 +1,1 @@
-web: node server.js
+web: gunicorn --bind 0.0.0.0:$PORT app:app
