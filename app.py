@@ -1,9 +1,10 @@
 # app.py
 """
-FarmSync single-file Flask app (fixed migrations + improved UI)
-- Safe migrations: create tables and ALTER to add missing columns (non-destructive)
-- Proper param queries and VALUES keyword
-- Improved UI/CSS and better flash messaging
+FarmSync single-file Flask app (schema-aware registration + improved UI)
+- Safe migrations: create tables and add missing columns non-destructively
+- Schema-aware register() to avoid NOT NULL errors (build INSERT using actual columns)
+- Proper parameterized queries and VALUES keyword
+- Improved UI/CSS and clear flash/error handling
 """
 import os
 import re
@@ -12,7 +13,7 @@ from functools import wraps
 
 from flask import (
     Flask, request, session, redirect, url_for, jsonify,
-    render_template_string, flash, get_flashed_messages
+    render_template_string, flash
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 import psycopg2
@@ -59,6 +60,7 @@ def run_query_fetchall(query, params=None):
         cur.close()
         return rows, cols
     except Exception as e:
+        # Log query + params for debugging
         print("DB fetchall error:", e, "Query:", query, "Params:", params)
         if cur:
             try: cur.close()
@@ -102,7 +104,7 @@ def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if not session.get("user_id"):
-            return redirect(url_for("login_page", next=request.path))
+            return redirect(url_for("index"))
         return f(*args, **kwargs)
     return decorated
 
@@ -111,55 +113,69 @@ EMAIL_RE = re.compile(r"^[^@]+@[^@]+\.[^@]+$")
 def valid_email(e): return bool(EMAIL_RE.match(e or ""))
 def valid_password(p): return p and len(p) >= 6
 
-# ----------------- Migrations: safe (create and alter) -----------------
+# ----------------- Schema helpers & migrations -----------------
+def get_table_columns(table_name):
+    """
+    Return a set of column names for table_name in the current DB schema.
+    Returns empty set on error.
+    """
+    try:
+        q = """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = %s AND table_schema = current_schema()
+        """
+        rows, cols = run_query_fetchall(q, (table_name,))
+        if rows is None:
+            return set()
+        return set(r[0] for r in rows)
+    except Exception as e:
+        print("get_table_columns error:", e)
+        return set()
+
 def ensure_tables_and_columns():
     """
-    Create tables if not present and add missing columns using ALTER TABLE ... ADD COLUMN IF NOT EXISTS
-    This helps existing DBs that were created earlier to be upgraded without errors.
+    Create minimal tables if missing, and add common optional columns if missing.
+    This function is safe to run multiple times.
     """
-    # Create core tables with essential columns (if not exists)
-    create_users = """
+    # Minimal create statements
+    run_query_commit("""
     CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         email TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
-    """
-    create_farmers = """
+    """)
+    run_query_commit("""
     CREATE TABLE IF NOT EXISTS farmers (
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
-    """
-    create_orders = """
+    """)
+    run_query_commit("""
     CREATE TABLE IF NOT EXISTS orders (
         id SERIAL PRIMARY KEY,
         farmer_id INTEGER REFERENCES farmers(id) ON DELETE SET NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
-    """
-    run_query_commit(create_users)
-    run_query_commit(create_farmers)
-    run_query_commit(create_orders)
+    """)
 
-    # Add optional/missing columns to users, farmers, orders safely
-    alter_statements = [
-        # users
+    # Add commonly used optional columns (non-fatal if already exist)
+    optional_alters = [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP",
-        # farmers
         "ALTER TABLE farmers ADD COLUMN IF NOT EXISTS location TEXT",
         "ALTER TABLE farmers ADD COLUMN IF NOT EXISTS contact TEXT",
         "ALTER TABLE farmers ADD COLUMN IF NOT EXISTS products TEXT",
-        # orders
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS farmer_name TEXT",
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS items TEXT",
-        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ongoing'",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT",
         "ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_date DATE"
     ]
-    for stmt in alter_statements:
+    for stmt in optional_alters:
         run_query_commit(stmt)
 
 # run migrations at startup
@@ -210,6 +226,7 @@ BASE_HEAD = """
     .flash.error{background:#fff4f4;color:var(--danger);border:1px solid #ffd5d5}
     .flash.success{background:#f0fff3;color:var(--success);border:1px solid #cdeecf}
     .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    .small{background:#f3f4f6;padding:6px 8px;border-radius:8px}
   </style>
 </head>
 <body>
@@ -379,6 +396,7 @@ def register():
     email = (request.form.get("email") or "").strip().lower()
     password = request.form.get("password") or ""
     display_name = (request.form.get("display_name") or "").strip()
+
     if not valid_email(email):
         flash("Please provide a valid email address.", "error")
         return redirect(url_for("index"))
@@ -386,6 +404,7 @@ def register():
         flash("Password must be at least 6 characters.", "error")
         return redirect(url_for("index"))
 
+    # Check if user exists
     rows, cols = run_query_fetchall("SELECT id FROM users WHERE email = %s", (email,))
     if rows is None:
         flash("Database error. Try again later.", "error")
@@ -394,18 +413,54 @@ def register():
         flash("Email already registered. Please login.", "error")
         return redirect(url_for("index"))
 
+    # Build insert according to actual DB columns
+    user_cols = get_table_columns('users')  # set of column names
+    cols_to_insert = []
+    placeholders = []
+    params = []
+
+    # Always include email and password_hash (created in migrations)
+    cols_to_insert.append('email')
+    placeholders.append('%s')
+    params.append(email)
+
     pw_hash = generate_password_hash(password)
-    ok = run_query_commit(
-        "INSERT INTO users (email, password_hash, display_name) VALUES (%s, %s, %s)",
-        (email, pw_hash, display_name or None)
-    )
+    cols_to_insert.append('password_hash')
+    placeholders.append('%s')
+    params.append(pw_hash)
+
+    # If DB has display_name, use it
+    if 'display_name' in user_cols:
+        cols_to_insert.append('display_name')
+        placeholders.append('%s')
+        params.append(display_name or None)
+
+    # If DB has name column but not display_name, populate 'name' with display_name or email
+    if 'name' in user_cols and 'display_name' not in user_cols:
+        cols_to_insert.append('name')
+        placeholders.append('%s')
+        params.append(display_name or email)
+
+    # If both exist, optionally set name as well (so older apps that read 'name' still work)
+    if 'name' in user_cols and 'display_name' in user_cols:
+        # avoid duplicate if already added name above
+        if 'name' not in cols_to_insert:
+            cols_to_insert.append('name')
+            placeholders.append('%s')
+            params.append(display_name or email)
+
+    # Build and execute insert
+    cols_sql = ", ".join(cols_to_insert)
+    placeholders_sql = ", ".join(placeholders)
+    insert_q = f"INSERT INTO users ({cols_sql}) VALUES ({placeholders_sql})"
+    ok = run_query_commit(insert_q, tuple(params))
     if not ok:
-        # Try a fallback: if display_name column is missing, insert without it
-        # (migration should have added it, but handle gracefully)
+        # As last resort, try minimal insert (email + password_hash) if DB enforces other constraints
         ok2 = run_query_commit("INSERT INTO users (email, password_hash) VALUES (%s, %s)", (email, pw_hash))
         if not ok2:
             flash("Failed to create account. Try later.", "error")
             return redirect(url_for("index"))
+
     flash("Account created — please log in.", "success")
     return redirect(url_for("index"))
 
@@ -417,7 +472,8 @@ def login():
         flash("Provide email and password.", "error")
         return redirect(url_for("index"))
 
-    rows, cols = run_query_fetchall("SELECT id, password_hash, display_name FROM users WHERE email = %s", (email,))
+    # We select whichever columns exist safely; at minimum email & password_hash exist per migrations.
+    rows, cols = run_query_fetchall("SELECT id, password_hash, display_name, name FROM users WHERE email = %s", (email,))
     if rows is None:
         flash("Database error. Try again later.", "error")
         return redirect(url_for("index"))
@@ -428,16 +484,26 @@ def login():
     user_row = rows[0]
     user_id = user_row[0]
     pw_hash = user_row[1]
-    display_name = user_row[2] if len(user_row) > 2 else None
+    # display_name might be in position 2 if exists; name in position 3 if exists.
+    display_name = None
+    try:
+        # find indices of columns to be robust
+        # But since we select fixed columns above (id,password_hash,display_name,name),
+        # accessing by index is safe even if values are None.
+        display_name = user_row[2] or user_row[3] or email
+    except Exception:
+        display_name = email
+
     if not check_password_hash(pw_hash, password):
         flash("Incorrect password.", "error")
         return redirect(url_for("index"))
 
     session["user_id"] = user_id
     session["user_email"] = email
-    session["user_name"] = display_name or email
-    # update last_login for bookkeeping (safe: add column earlier)
-    run_query_commit("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = %s", (user_id,))
+    session["user_name"] = display_name
+    # update last_login if column exists
+    if 'last_login' in get_table_columns('users'):
+        run_query_commit("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = %s", (user_id,))
     flash("Logged in successfully.", "success")
     return redirect(url_for("dashboard"))
 
