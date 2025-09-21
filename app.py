@@ -1,49 +1,67 @@
 # app.py
 """
-Single-file Farm Marketplace app (directly connects to Neon Postgres).
-WARNING: This file contains a hard-coded DB connection string. Do NOT commit to public repos.
-After testing, move the DSN to environment variable NEON_DB_URL and rotate credentials.
+Farm Marketplace - single-file Flask app
+Features:
+- Gmail OAuth-only login (Authlib)
+- Role selection after first login (Farmer / Buyer / Admin)
+- Farmer and Buyer dashboards
+- Listings with multiple images
+- Cart managed client-side (localStorage)
+- Orders, order_items, reviews, messages
+- Basic analytics for farmers
+- Uses Neon Postgres (DSN hard-coded per user request)
+WARNING: This file contains DB credentials in code. Do NOT publish this.
 """
 
 import os
 import re
 import uuid
-from datetime import date
+import json
+import logging
+from datetime import datetime, date
 from functools import wraps
-from io import StringIO
+from io import BytesIO
 
 from flask import (
     Flask, request, session, redirect, url_for, jsonify,
     render_template_string, flash, send_from_directory, make_response
 )
 from werkzeug.utils import secure_filename
-from werkzeug.security import generate_password_hash, check_password_hash
-
+from authlib.integrations.flask_client import OAuth
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 
-# ---------------- Configuration ----------------
+# ---------------- Config ----------------
+APP_NAME = "Farm Marketplace"
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret-change-me")
+app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024  # 8MB file uploads
+app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret-please-change")
 PORT = int(os.environ.get("PORT", 3000))
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "")  # e.g. https://your-app.up.railway.app
 
-# ---- DIRECT Neon Postgres URL (as requested) ----
-NEON_DB_URL = "postgresql://neondb_owner:npg_jgROvpDtrm03@ep-hidden-truth-aev5l7a7-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+# Neon Postgres DSN (embedded as requested)
+NEON_DSN = "postgresql://neondb_owner:npg_jgROvpDtrm03@ep-hidden-truth-aev5l7a7-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
-# Upload settings
+# Uploads
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif"}
-MAX_CONTENT_LENGTH = 8 * 1024 * 1024  # 8 MB
-app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
+ALLOWED_IMAGES = {"png", "jpg", "jpeg", "gif"}
 
-# ---------------- Postgres connection pool ----------------
+# Google OAuth config (must set in env for real Gmail OAuth)
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ---------------- Database Pool ----------------
 try:
-    pg_pool = psycopg2.pool.SimpleConnectionPool(minconn=1, maxconn=20, dsn=NEON_DB_URL, cursor_factory=RealDictCursor)
-    app.logger.info("Connected to Postgres via NEON_DB_URL.")
+    pg_pool = psycopg2.pool.SimpleConnectionPool(minconn=1, maxconn=20, dsn=NEON_DSN, cursor_factory=RealDictCursor)
+    logger.info("Postgres pool created.")
 except Exception as e:
-    app.logger.error("Failed to create Postgres pool: %s", e)
+    logger.exception("Failed to create Postgres pool. Exiting.")
     raise
 
 def get_conn():
@@ -53,8 +71,8 @@ def put_conn(conn):
     if conn:
         pg_pool.putconn(conn)
 
-# ---------------- DB helpers ----------------
-def run_fetchall(query, params=None):
+# DB helpers
+def db_fetchall(query, params=None):
     conn = None
     cur = None
     try:
@@ -65,16 +83,16 @@ def run_fetchall(query, params=None):
         cur.close()
         return [dict(r) for r in rows] if rows else []
     except Exception as e:
-        app.logger.error("DB fetchall error: %s Query:%s Params:%s", e, query, params)
-        try:
-            if cur: cur.close()
-        except: pass
+        logger.error("db_fetchall error: %s -- SQL: %s -- params: %s", e, query, params)
+        if cur:
+            try: cur.close()
+            except: pass
         return None
     finally:
         if conn:
             put_conn(conn)
 
-def run_fetchone(query, params=None):
+def db_fetchone(query, params=None):
     conn = None
     cur = None
     try:
@@ -85,742 +103,940 @@ def run_fetchone(query, params=None):
         cur.close()
         return dict(row) if row else None
     except Exception as e:
-        app.logger.error("DB fetchone error: %s Query:%s Params:%s", e, query, params)
-        try:
-            if cur: cur.close()
-        except: pass
+        logger.error("db_fetchone error: %s -- SQL: %s -- params: %s", e, query, params)
+        if cur:
+            try: cur.close()
+            except: pass
         return None
     finally:
         if conn:
             put_conn(conn)
 
-def run_commit(query, params=None, returning=False):
+def db_commit(query, params=None, returning=False):
     conn = None
     cur = None
     try:
         conn = get_conn()
         cur = conn.cursor()
         cur.execute(query, params or ())
-        result_id = None
+        rv = None
         if returning:
             maybe = cur.fetchone()
             if maybe:
-                # psycopg2 returns a RealDictRow or tuple depending on query
                 try:
-                    result_id = maybe[0]
+                    rv = maybe[0]
                 except Exception:
                     try:
-                        result_id = list(maybe.values())[0]
-                    except Exception:
-                        result_id = None
+                        rv = list(maybe.values())[0]
+                    except:
+                        rv = None
         conn.commit()
         cur.close()
-        return result_id if returning else True
+        return rv if returning else True
     except Exception as e:
-        app.logger.error("DB commit error: %s Query:%s Params:%s", e, query, params)
+        logger.error("db_commit error: %s -- SQL: %s -- params: %s", e, query, params)
         try:
             if conn: conn.rollback()
         except: pass
-        try:
-            if cur: cur.close()
-        except: pass
+        if cur:
+            try: cur.close()
+            except: pass
         return None if returning else False
     finally:
         if conn:
             put_conn(conn)
 
-# ---------------- Schema migrations ----------------
+# ---------------- Migrations: create tables ----------------
 def ensure_schema():
-    migrations = [
+    stmts = [
         # users
         """
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
             email TEXT UNIQUE NOT NULL,
-            display_name TEXT,
+            name TEXT,
             role TEXT NOT NULL DEFAULT 'buyer',
-            password_hash TEXT,
-            is_active BOOLEAN DEFAULT TRUE,
-            last_login TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """,
-        # listings (products)
-        """
-        CREATE TABLE IF NOT EXISTS listings (
-            id SERIAL PRIMARY KEY,
-            seller_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-            title TEXT NOT NULL,
-            category TEXT,
-            description TEXT,
-            price NUMERIC(12,2) NOT NULL DEFAULT 0.0,
-            stock INTEGER NOT NULL DEFAULT 0,
-            delivery_options TEXT,
-            is_organic BOOLEAN DEFAULT FALSE,
-            freshness TEXT,
             location TEXT,
+            profile_image TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+        # farmers - optional extra profile for farmers
+        """
+        CREATE TABLE IF NOT EXISTS farmers (
+            user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            farm_name TEXT,
+            description TEXT,
+            location TEXT,
+            certifications TEXT,
+            rating NUMERIC DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+        # products
+        """
+        CREATE TABLE IF NOT EXISTS products (
+            id SERIAL PRIMARY KEY,
+            farmer_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            name TEXT NOT NULL,
+            category TEXT,
+            price NUMERIC(12,2) NOT NULL DEFAULT 0,
+            unit TEXT,
+            quantity INTEGER DEFAULT 0,
+            description TEXT,
+            status TEXT DEFAULT 'active',
+            location TEXT,
+            is_organic BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
+        );
         """,
-        # images
+        # product images
         """
-        CREATE TABLE IF NOT EXISTS listing_images (
+        CREATE TABLE IF NOT EXISTS product_images (
             id SERIAL PRIMARY KEY,
-            listing_id INTEGER REFERENCES listings(id) ON DELETE CASCADE,
-            image_path TEXT NOT NULL
-        )
+            product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+            path TEXT NOT NULL
+        );
         """,
         # orders
         """
         CREATE TABLE IF NOT EXISTS orders (
             id SERIAL PRIMARY KEY,
             buyer_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-            total_amount NUMERIC(12,2) DEFAULT 0.0,
+            farmer_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            total_amount NUMERIC(12,2) DEFAULT 0,
             status TEXT DEFAULT 'pending',
+            delivery_date DATE,
+            address TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
+        );
         """,
-        # order items
+        # order_items
         """
         CREATE TABLE IF NOT EXISTS order_items (
             id SERIAL PRIMARY KEY,
             order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
-            listing_id INTEGER REFERENCES listings(id) ON DELETE SET NULL,
-            seller_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-            listing_title TEXT,
-            unit_price NUMERIC(12,2),
+            product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
             quantity INTEGER,
-            line_total NUMERIC(12,2)
-        )
+            price NUMERIC(12,2)
+        );
         """,
-        # ratings
+        # reviews
         """
-        CREATE TABLE IF NOT EXISTS ratings (
+        CREATE TABLE IF NOT EXISTS reviews (
             id SERIAL PRIMARY KEY,
-            listing_id INTEGER REFERENCES listings(id) ON DELETE CASCADE,
             buyer_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-            rating INTEGER CHECK (rating >= 1 AND rating <= 5),
-            review TEXT,
+            farmer_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+            rating INTEGER CHECK (rating >=1 AND rating <= 5),
+            comment TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
+        );
         """,
-        # useful indexes
-        "CREATE INDEX IF NOT EXISTS idx_listings_category ON listings(category)",
-        "CREATE INDEX IF NOT EXISTS idx_listings_seller ON listings(seller_id)",
-        "CREATE INDEX IF NOT EXISTS idx_orders_buyer ON orders(buyer_id)",
+        # messages (simple farmer-buyer messaging)
+        """
+        CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+            sender_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            receiver_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            subject TEXT,
+            body TEXT,
+            read BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+        # cart: lightweight server-side persistent cart (also client uses localStorage)
+        """
+        CREATE TABLE IF NOT EXISTS carts (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            product_id INTEGER REFERENCES products(id),
+            quantity INTEGER DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+        # indexes
+        "CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);",
+        "CREATE INDEX IF NOT EXISTS idx_products_farmer ON products(farmer_id);",
+        "CREATE INDEX IF NOT EXISTS idx_orders_buyer ON orders(buyer_id);"
     ]
-    for m in migrations:
-        ok = run_commit(m)
+    for s in stmts:
+        ok = db_commit(s)
         if not ok:
-            app.logger.error("Migration failed: %s", m)
+            logger.error("Migration failed for statement: %s", s)
 
 ensure_schema()
 
 # ---------------- Utilities ----------------
-EMAIL_RE = re.compile(r"^[^@]+@gmail\.com$")  # only allow gmail for now
-def is_valid_gmail(email):
+EMAIL_RE = re.compile(r"^[^@]+@gmail\.com$")  # enforce Gmail-only
+def is_gmail(email):
     return bool(email and EMAIL_RE.match(email.strip().lower()))
 
 def allowed_file(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_IMAGES
 
-def save_image(file_storage):
-    if not file_storage or file_storage.filename == "":
+def save_upload(file):
+    if not file or file.filename == "":
         return None
-    if not allowed_file(file_storage.filename):
+    if not allowed_file(file.filename):
         return None
-    name = secure_filename(file_storage.filename)
-    unique = f"{uuid.uuid4().hex[:12]}-{name}"
+    name = secure_filename(file.filename)
+    unique = f"{uuid.uuid4().hex}_{name}"
     dest = os.path.join(UPLOAD_DIR, unique)
-    file_storage.save(dest)
+    file.save(dest)
     return unique
 
 def login_required(f):
     @wraps(f)
-    def inner(*args, **kwargs):
+    def wrapper(*args, **kwargs):
         if not session.get("user_id"):
-            flash("Please sign in.", "error")
-            return redirect(url_for("auth"))
+            flash("Please sign in.")
+            return redirect(url_for("login"))
         return f(*args, **kwargs)
-    return inner
+    return wrapper
 
-def roles_required(*roles):
-    def decorator(f):
+def role_required(*roles):
+    def deco(f):
         @wraps(f)
-        def inner(*args, **kwargs):
+        def wrapper(*args, **kwargs):
             if not session.get("user_id"):
-                flash("Please sign in.", "error")
-                return redirect(url_for("auth"))
-            if session.get("user_role") not in roles:
-                flash("Access denied for your role.", "error")
-                return redirect(url_for("marketplace"))
+                flash("Please sign in.")
+                return redirect(url_for("login"))
+            if session.get("role") not in roles:
+                flash("Access denied for your role.")
+                return redirect(url_for("index"))
             return f(*args, **kwargs)
-        return inner
-    return decorator
+        return wrapper
+    return deco
 
-# ---------------- Simple Templates ----------------
-NAV = """
-<nav style="display:flex;gap:12px;align-items:center;margin-bottom:12px">
-  <a href="{{ url_for('index') }}">Home</a>
-  <a href="{{ url_for('marketplace') }}">Marketplace</a>
-  {% if session.get('user_id') %}
-    {% if session.get('user_role') == 'farmer' %}
-      <a href="{{ url_for('farmer_dashboard') }}">Farmer</a>
-    {% endif %}
-    {% if session.get('user_role') == 'buyer' %}
-      <a href="{{ url_for('cart') }}">Cart ({{ session.get('cart')|length if session.get('cart') else 0 }})</a>
-    {% endif %}
-    {% if session.get('user_role') == 'admin' %}
-      <a href="{{ url_for('admin_dashboard') }}">Admin</a>
-    {% endif %}
-    <a href="{{ url_for('logout') }}">Logout</a>
-  {% else %}
-    <a href="{{ url_for('auth') }}">Sign in</a>
-  {% endif %}
-</nav>
-"""
+# ---------------- OAuth (Google Gmail-only) ----------------
+oauth = OAuth(app)
+if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and APP_BASE_URL:
+    oauth.register(
+        name='google',
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+        client_kwargs={'scope': 'openid email profile'}
+    )
+    OAUTH_READY = True
+else:
+    OAUTH_READY = False
+    logger.warning("Google OAuth not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and APP_BASE_URL env vars for Gmail OAuth.")
 
-INDEX_HTML = f"<!doctype html><html><body><div style='max-width:1100px;margin:20px auto;'>{NAV}<h1>Farm Marketplace</h1><p>Gmail-only sign-in. Choose a role at sign-in (buyer/farmer/admin).</p></div></body></html>"
-
-AUTH_HTML = f"""
-<!doctype html><html><body><div style='max-width:700px;margin:20px auto;'>{NAV}
-  <h2>Sign in (Gmail only)</h2>
-  {{% for m in get_flashed_messages() %}}<div style="background:#fee;padding:8px;margin-bottom:8px">{{{{ m }}}}</div>{{% endfor %}}
-  <form method="post">
-    <label>Email (@gmail.com):</label><br><input name="email" type="email" required><br><br>
-    <label>Display name (optional):</label><br><input name="display_name"><br><br>
-    <label>Role:</label><br>
-    <select name="role">
-      <option value="buyer">Buyer</option>
-      <option value="farmer">Farmer</option>
-      <option value="admin">Admin</option>
-    </select><br><br>
-    <button type="submit">Sign in</button>
-  </form>
-</div></body></html>
-"""
-
-MARKET_HTML = """
-<!doctype html><html><body><div style='max-width:1100px;margin:20px auto;'>""" + NAV + """
-  <h2>Marketplace</h2>
-  <form method="get" action="{{ url_for('marketplace') }}">
-    <input name="q" placeholder="search product or farmer" value="{{ q or '' }}">
-    <select name="category">
-      <option value="">All categories</option>
-      {% for c in categories %}<option value="{{ c }}" {% if c==category %}selected{% endif %}>{{ c }}</option>{% endfor %}
-    </select>
-    <label>Organic <input type="checkbox" name="organic" value="1" {% if organic %}checked{% endif %}></label>
-    <select name="sort">
-      <option value="">Sort</option>
-      <option value="price_asc" {% if sort=='price_asc' %}selected{% endif %}>Price low→high</option>
-      <option value="price_desc" {% if sort=='price_desc' %}selected{% endif %}>Price high→low</option>
-      <option value="newest" {% if sort=='newest' %}selected{% endif %}>Newest</option>
-      <option value="rating" {% if sort=='rating' %}selected{% endif %}>Rating</option>
-    </select>
-    <button type="submit">Filter</button>
-  </form>
-
-  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-top:12px">
-  {% for l in listings %}
-    <div style="border:1px solid #ddd;padding:8px;border-radius:8px">
-      {% if l.images and l.images|length>0 %}
-        <img src="{{ url_for('uploaded_file', filename=l.images[0]) }}" style="max-height:140px">
-      {% else %}
-        <div style="height:140px;background:#f8f8f8;display:flex;align-items:center;justify-content:center;color:#aaa">No image</div>
-      {% endif %}
-      <h3>{{ l.title }}</h3>
-      <div>Seller: {{ l.seller_name or '—' }}</div>
-      <div>Category: {{ l.category or '—' }}</div>
-      <div>Price: ₹{{ '%.2f'|format(l.price) }}</div>
-      <div>Stock: {{ l.stock }}</div>
-      <div>Organic: {{ 'Yes' if l.is_organic else 'No' }}</div>
-      <div>Avg Rating: {{ l.avg_rating or '—' }}</div>
-      <div style="margin-top:6px">
-        <a href="{{ url_for('view_listing', listing_id=l.id) }}">View</a>
-        {% if session.get('user_role') == 'buyer' %}
-          <form method="post" action="{{ url_for('add_to_cart', listing_id=l.id) }}" style="display:inline">
-            <input name="qty" value="1" size="2">
-            <button type="submit">Add to cart</button>
-          </form>
+# ---------------- Single-file HTML template ----------------
+# To keep single-file requirement: embed CSS and JS in this template and render via render_template_string
+BASE_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>{{ title or 'Farm Marketplace' }}</title>
+<style>
+:root{--green:#2f8f3a;--dark:#0f172a;--muted:#64748b;--card:#fff}
+body{font-family:Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; margin:0;background:#f4faf6;color:var(--dark)}
+.topbar{background:var(--card);border-bottom:1px solid #e6eef2;padding:12px 20px;display:flex;align-items:center;justify-content:space-between}
+.brand{font-weight:700;color:var(--green);font-size:1.2rem}
+.nav{display:flex;gap:10px;align-items:center}
+.btn{background:var(--green);color:white;padding:8px 12px;border-radius:8px;border:none;cursor:pointer}
+.card{background:var(--card);padding:16px;border-radius:12px;border:1px solid #e6eef2;box-shadow:0 6px 18px rgba(15,23,42,0.03)}
+.container{max-width:1100px;margin:18px auto;padding:0 12px}
+.grid{display:grid;gap:16px}
+@media(min-width:900px){.grid{grid-template-columns:300px 1fr}}
+.listing-grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+.product-card img{width:100%;height:160px;object-fit:cover;border-radius:8px}
+.search-row{display:flex;gap:8px;align-items:center;margin-bottom:12px}
+.input{padding:8px;border:1px solid #e6eef2;border-radius:8px;width:100%}
+.small{font-size:0.9rem;color:var(--muted)}
+.badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#e6faf0;color:var(--green);font-weight:600}
+.notice{padding:8px;background:#fffbeb;border-radius:8px;border:1px solid #fce6b5;color:#7a4b00}
+.footer{padding:28px 0;text-align:center;color:var(--muted);font-size:0.9rem}
+.list-item{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px dashed #eef6ef}
+.form-row{margin-bottom:10px}
+.label{display:block;margin-bottom:6px;font-weight:600}
+.btn-secondary{background:#fff;border:1px solid #e6eef2;color:var(--dark)}
+.kv{display:flex;gap:8px;align-items:center}
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand">🚜 Farm Marketplace</div>
+    <div class="nav">
+      <a href="{{ url_for('index') }}" class="small">Home</a>
+      <a href="{{ url_for('market') }}" class="small">Marketplace</a>
+      {% if session.user_id %}
+        {% if session.role == 'farmer' %}
+        <a href="{{ url_for('farmer_dashboard') }}" class="small">Farmer</a>
         {% endif %}
-      </div>
-    </div>
-  {% else %}
-    <div>No listings found.</div>
-  {% endfor %}
-  </div>
-</div></body></html>
-"""
-
-LISTING_HTML = """
-<!doctype html><html><body><div style='max-width:900px;margin:20px auto;'>""" + NAV + """
-  <h2>{{ listing.title }}</h2>
-  <div style="display:flex;gap:12px">
-    <div style="min-width:320px">
-      {% for img in images %}
-        <img src="{{ url_for('uploaded_file', filename=img) }}" style="max-width:320px;display:block;margin-bottom:8px">
-      {% endfor %}
-    </div>
-    <div>
-      <div>Seller: {{ seller.display_name or seller.email }}</div>
-      <div>Category: {{ listing.category or '—' }}</div>
-      <div>Price: ₹{{ '%.2f'|format(listing.price) }}</div>
-      <div>Stock: {{ listing.stock }}</div>
-      <div>Delivery: {{ listing.delivery_options or '—' }}</div>
-      <div>Organic: {{ 'Yes' if listing.is_organic else 'No' }}</div>
-      <div>Freshness: {{ listing.freshness or '—' }}</div>
-      <p>{{ listing.description or '' }}</p>
-      {% if session.get('user_role') == 'buyer' %}
-        <form method="post" action="{{ url_for('add_to_cart', listing_id=listing.id) }}">
-          <label>Qty</label><input name="qty" value="1" size="3">
-          <button type="submit">Add to cart</button>
-        </form>
+        {% if session.role == 'buyer' %}
+        <a href="{{ url_for('cart') }}" class="small">Cart</a>
+        {% endif %}
+        {% if session.role == 'admin' %}
+        <a href="{{ url_for('admin') }}" class="small">Admin</a>
+        {% endif %}
+        <span class="small">{{ session.user_email }}</span>
+        <a href="{{ url_for('logout') }}" class="btn btn-secondary">Logout</a>
+      {% else %}
+        {% if oauth_ready %}
+          <a href="{{ url_for('login') }}" class="btn">Sign in with Google</a>
+        {% else %}
+          <a href="{{ url_for('login') }}" class="btn">Sign in (configure Google)</a>
+        {% endif %}
       {% endif %}
     </div>
   </div>
 
-  <h3>Reviews</h3>
-  <div>
-    {% for r in reviews %}
-      <div style="border-top:1px solid #eee;padding:8px 0;">
-        <strong>{{ r.buyer_name }}</strong> — {{ r.rating }}/5<br>{{ r.review }}
-      </div>
-    {% else %}
-      <div>No reviews yet.</div>
-    {% endfor %}
+  <div class="container">
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <div style="margin:12px 0">
+          {% for m in messages %}<div class="notice">{{ m }}</div>{% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+    {{ body|safe }}
   </div>
-</div></body></html>
+
+  <div class="footer">Built with care • No payments integrated • Use Gmail OAuth for sign-in.</div>
+
+<script>
+// Client-side helper: localStorage cart management
+window.app = {
+  addToCart: function(product, qty){
+    qty = parseInt(qty)||1;
+    const key = 'cart_v1';
+    let cart = JSON.parse(localStorage.getItem(key) || '{}');
+    cart[product] = (cart[product]||0) + qty;
+    localStorage.setItem(key, JSON.stringify(cart));
+    alert('Added to cart');
+  },
+  getCart: function(){ return JSON.parse(localStorage.getItem('cart_v1')||'{}'); },
+  setCart: function(c){ localStorage.setItem('cart_v1', JSON.stringify(c)); },
+  clearCart: function(){ localStorage.removeItem('cart_v1'); }
+};
+
+// on pages where server wants to read local cart, it can POST /cart/sync with JSON
+</script>
+</body>
+</html>
 """
 
-CART_HTML = """
-<!doctype html><html><body><div style='max-width:900px;margin:20px auto;'>""" + NAV + """
-  <h2>Your Cart</h2>
-  {% if cart_items %}
-    <table border="1" cellpadding="8" cellspacing="0" style="width:100%;border-collapse:collapse">
-      <tr><th>Item</th><th>Unit</th><th>Qty</th><th>Line total</th><th>Action</th></tr>
-      {% for it in cart_items %}
-        <tr>
-          <td>{{ it.title }}</td>
-          <td>₹{{ '%.2f'|format(it.price) }}</td>
-          <td>{{ it.qty }}</td>
-          <td>₹{{ '%.2f'|format(it.line_total) }}</td>
-          <td>
-            <form method="post" action="{{ url_for('remove_from_cart', listing_id=it.listing_id) }}">
-              <button type="submit">Remove</button>
-            </form>
-          </td>
-        </tr>
-      {% endfor %}
-    </table>
-    <h3>Total: ₹{{ '%.2f'|format(total) }}</h3>
-    <form method="post" action="{{ url_for('checkout') }}">
-      <button type="submit">Checkout (Mock Payment)</button>
-    </form>
-  {% else %}
-    <p>Your cart is empty.</p>
-  {% endif %}
-</div></body></html>
-"""
+# ---------------- Routes: auth, role selection ----------------
+@app.route("/login")
+def login():
+    if not OAUTH_READY:
+        # show instructions and fallback to mock sign-in
+        body = """
+        <div class="card"><h2>Google OAuth not configured</h2>
+        <p class="small">To enable Gmail-only OAuth sign-in, set environment variables GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and APP_BASE_URL (your deployed URL) and redeploy.</p>
+        <p>If you want to mock-sign in for testing, use the form below (Gmail enforced).</p>
+        <form method="post" action="/auth/mock">
+          <div class="form-row"><label class="label">Gmail address</label><input name="email" class="input" required></div>
+          <div class="form-row"><label class="label">Display name</label><input name="name" class="input"></div>
+          <div class="form-row"><label class="label">Role</label><select name="role" class="input"><option>buyer</option><option>farmer</option><option>admin</option></select></div>
+          <button class="btn">Mock Sign in</button>
+        </form></div>
+        """
+        return render_template_string(BASE_HTML, title="Login", body=body, oauth_ready=False)
+    redirect_uri = APP_BASE_URL.rstrip("/") + url_for('auth_callback')
+    return oauth.google.authorize_redirect(redirect_uri)
 
-FARMER_HTML = """
-<!doctype html><html><body><div style='max-width:1100px;margin:20px auto;'>""" + NAV + """
-  <h2>Farmer Dashboard</h2>
-  <h3>Create Listing</h3>
-  <form method="post" action="{{ url_for('create_listing') }}" enctype="multipart/form-data">
-    <input name="title" placeholder="Title" required><br>
-    <input name="category" placeholder="Category"><br>
-    <textarea name="description" placeholder="Description"></textarea><br>
-    <input name="price" type="number" step="0.01" value="0"><br>
-    <input name="stock" type="number" value="0"><br>
-    <input name="delivery_options" placeholder="Delivery options"><br>
-    <label>Organic <input name="is_organic" type="checkbox" value="1"></label><br>
-    <input name="freshness" placeholder="Freshness"><br>
-    <input name="location" placeholder="Location"><br>
-    <label>Images (multiple) <input name="images" type="file" multiple accept="image/*"></label><br>
-    <button type="submit">Create Listing</button>
-  </form>
+@app.route("/auth/callback")
+def auth_callback():
+    if not OAUTH_READY:
+        flash("OAuth not configured.")
+        return redirect(url_for("login"))
+    token = oauth.google.authorize_access_token()
+    userinfo = oauth.google.parse_id_token(token)
+    # userinfo contains 'email', 'email_verified', 'name', 'picture'
+    email = userinfo.get('email')
+    if not email or not is_gmail(email):
+        flash("Please sign in with a Gmail address.")
+        return redirect(url_for('index'))
+    name = userinfo.get('name') or email.split('@')[0]
+    # upsert user
+    existing = db_fetchone("SELECT * FROM users WHERE email = %s", (email,))
+    if not existing:
+        uid = db_commit("INSERT INTO users (email, name) VALUES (%s,%s) RETURNING id", (email, name), returning=True)
+        if not uid:
+            flash("DB error creating user.")
+            return redirect(url_for("index"))
+        # default role = buyer; after first login we prompt for role selection
+        session['user_id'] = uid
+        session['user_email'] = email
+        session['role'] = None
+        session['user_name'] = name
+        return redirect(url_for('choose_role'))
+    # existing user
+    session['user_id'] = existing['id']
+    session['user_email'] = existing['email']
+    session['role'] = existing.get('role')
+    session['user_name'] = existing.get('name') or existing.get('email')
+    flash(f"Welcome back, {session['user_name']}")
+    if not session['role']:
+        return redirect(url_for('choose_role'))
+    return redirect(url_for('index'))
 
-  <h3>Your listings</h3>
-  {% for l in my_listings %}
-    <div style="border:1px solid #ddd;padding:8px;margin-bottom:6px">
-      <strong>{{ l.title }}</strong> — ₹{{ '%.2f'|format(l.price) }} — Stock: {{ l.stock }} — <a href="{{ url_for('view_listing', listing_id=l.id) }}">View</a>
-      <form method="post" action="{{ url_for('delete_listing', listing_id=l.id) }}" style="display:inline" onsubmit="return confirm('Delete listing?')">
-        <button type="submit">Delete</button>
+@app.route("/auth/mock", methods=['POST'])
+def auth_mock():
+    # only used if OAuth not configured — create user if gmail pattern, allow selecting role
+    email = (request.form.get('email') or '').strip().lower()
+    name = (request.form.get('name') or '').strip()
+    role = (request.form.get('role') or 'buyer')
+    if not is_gmail(email):
+        flash("Please use a Gmail address.")
+        return redirect(url_for('login'))
+    existing = db_fetchone("SELECT * FROM users WHERE email = %s", (email,))
+    if not existing:
+        uid = db_commit("INSERT INTO users (email, name, role) VALUES (%s,%s,%s) RETURNING id", (email, name or None, role), returning=True)
+        if not uid:
+            flash("DB error.")
+            return redirect(url_for('login'))
+        session['user_id'] = uid
+    else:
+        # update role if provided
+        db_commit("UPDATE users SET role = %s, name = %s WHERE id = %s", (role, name or existing.get('name'), existing['id']))
+        session['user_id'] = existing['id']
+    session['user_email'] = email
+    session['user_name'] = name or email.split('@')[0]
+    session['role'] = role
+    flash("Signed in (mock).")
+    return redirect(url_for('index'))
+
+@app.route("/choose-role", methods=['GET', 'POST'])
+@login_required
+def choose_role():
+    if request.method == 'POST':
+        role = request.form.get('role')
+        if role not in ('farmer', 'buyer', 'admin'):
+            flash("Invalid role.")
+            return redirect(url_for('choose_role'))
+        db_commit("UPDATE users SET role = %s WHERE id = %s", (role, session['user_id']))
+        session['role'] = role
+        flash(f"Role set to {role}")
+        return redirect(url_for('profile'))
+    body = """
+    <div class="card"><h2>Choose your role</h2>
+    <p class="small">Are you a farmer selling produce, a buyer, or an admin?</p>
+    <form method="post">
+      <div class="form-row"><label class="label">Role</label>
+        <select name="role" class="input"><option value="farmer">Farmer</option><option value="buyer">Buyer</option><option value="admin">Admin</option></select>
+      </div>
+      <button class="btn">Continue</button>
+    </form></div>
+    """
+    return render_template_string(BASE_HTML, body=body, title="Choose role")
+
+@app.route("/profile", methods=['GET', 'POST'])
+@login_required
+def profile():
+    if request.method == 'POST':
+        name = request.form.get('name')
+        location = request.form.get('location')
+        profile_image = None
+        f = request.files.get('profile_image')
+        if f:
+            profile_image = save_upload(f)
+        db_commit("UPDATE users SET name=%s, location=%s, profile_image=%s WHERE id=%s", (name, location, profile_image, session['user_id']))
+        flash("Profile updated.")
+        return redirect(url_for('index'))
+    user = db_fetchone("SELECT * FROM users WHERE id = %s", (session['user_id'],))
+    body = f"""
+    <div class="card"><h2>Complete your profile</h2>
+      <form method="post" enctype="multipart/form-data">
+        <div class="form-row"><label class="label">Display name</label><input class="input" name="name" value="{user.get('name') if user else ''}"></div>
+        <div class="form-row"><label class="label">Location</label><input class="input" name="location" value="{user.get('location') if user else ''}"></div>
+        <div class="form-row"><label class="label">Profile image</label><input type="file" name="profile_image"></div>
+        <button class="btn">Save</button>
       </form>
     </div>
-  {% else %}
-    <div>No listings yet.</div>
-  {% endfor %}
-</div></body></html>
-"""
-
-ADMIN_HTML = """
-<!doctype html><html><body><div style='max-width:1100px;margin:20px auto;'>""" + NAV + """
-  <h2>Admin Dashboard</h2>
-  <h3>Users</h3>
-  {% for u in users %}
-    <div style="border:1px solid #ddd;padding:8px;margin-bottom:6px">
-      {{ u.id }} — {{ u.email }} — {{ u.display_name or '' }} — {{ u.role }}
-      <form method="post" action="{{ url_for('admin_change_role', user_id=u.id) }}" style="display:inline">
-        <select name="role">
-          <option value="buyer" {% if u.role=='buyer' %}selected{% endif %}>Buyer</option>
-          <option value="farmer" {% if u.role=='farmer' %}selected{% endif %}>Farmer</option>
-          <option value="admin" {% if u.role=='admin' %}selected{% endif %}>Admin</option>
-        </select>
-        <button type="submit">Change</button>
-      </form>
-    </div>
-  {% endfor %}
-  <h3>Orders</h3>
-  {% for o in orders %}
-    <div style="border:1px solid #ddd;padding:8px;margin-bottom:6px">
-      Order #{{ o.id }} — Buyer: {{ o.buyer_email or '—' }} — ₹{{ '%.2f'|format(o.total_amount or 0) }} — Status: {{ o.status }}
-      <form method="post" action="{{ url_for('admin_update_order', order_id=o.id) }}" style="display:inline">
-        <select name="status">
-          <option value="pending" {% if o.status=='pending' %}selected{% endif %}>pending</option>
-          <option value="paid" {% if o.status=='paid' %}selected{% endif %}>paid</option>
-          <option value="shipped" {% if o.status=='shipped' %}selected{% endif %}>shipped</option>
-          <option value="completed" {% if o.status=='completed' %}selected{% endif %}>completed</option>
-          <option value="cancelled" {% if o.status=='cancelled' %}selected{% endif %}>cancelled</option>
-        </select>
-        <button type="submit">Update</button>
-      </form>
-    </div>
-  {% endfor %}
-</div></body></html>
-"""
-
-# ---------------- Routes ----------------
-
-@app.route("/")
-def index():
-    return render_template_string(INDEX_HTML)
-
-@app.route("/auth", methods=["GET", "POST"])
-def auth():
-    if request.method == "POST":
-        email = (request.form.get("email") or "").strip().lower()
-        display_name = (request.form.get("display_name") or "").strip()
-        role = (request.form.get("role") or "buyer")
-        if not is_valid_gmail(email):
-            flash("Please sign in with a Gmail address (ends with @gmail.com).")
-            return redirect(url_for("auth"))
-        user = run_fetchone("SELECT * FROM users WHERE email = %s", (email,))
-        if not user:
-            # create user
-            new_id = run_commit("INSERT INTO users (email, display_name, role) VALUES (%s,%s,%s) RETURNING id",
-                                (email, display_name or None, role), returning=True)
-            if not new_id:
-                flash("Failed to create user (DB error).")
-                return redirect(url_for("auth"))
-            user = run_fetchone("SELECT * FROM users WHERE id = %s", (new_id,))
-        # set session
-        session["user_id"] = user["id"]
-        session["user_email"] = user["email"]
-        session["user_name"] = user.get("display_name") or user["email"]
-        session["user_role"] = user.get("role") or "buyer"
-        # update last login
-        run_commit("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = %s", (user["id"],))
-        flash(f"Signed in as {session['user_name']} ({session['user_role']})")
-        return redirect(url_for("marketplace"))
-    return render_template_string(AUTH_HTML)
+    """
+    return render_template_string(BASE_HTML, body=body, title="Profile")
 
 @app.route("/logout")
 def logout():
     session.clear()
     flash("Logged out.")
-    return redirect(url_for("index"))
+    return redirect(url_for('index'))
 
-def get_categories():
-    rows = run_fetchall("SELECT DISTINCT category FROM listings WHERE category IS NOT NULL AND category <> ''")
-    return [r['category'] for r in rows] if rows else []
+# ---------------- Public pages ----------------
+@app.route("/")
+def index():
+    # featured products + farmers
+    prods = db_fetchall("SELECT p.*, u.name as farmer_name FROM products p LEFT JOIN users u ON p.farmer_id = u.id WHERE p.status='active' ORDER BY p.created_at DESC LIMIT 6") or []
+    farmers = db_fetchall("SELECT u.id,u.name, f.farm_name FROM users u JOIN farmers f ON u.id=f.user_id ORDER BY f.created_at DESC LIMIT 6") or []
+    # build HTML
+    cards = ""
+    for p in prods:
+        img_row = db_fetchall("SELECT path FROM product_images WHERE product_id = %s ORDER BY id LIMIT 1", (p['id'],)) or []
+        img = img_row[0]['path'] if img_row else ''
+        cards += f"""
+        <div class="product-card card">
+          <img src="{url_for('uploaded_file', filename=img)}" onerror="this.src='https://via.placeholder.com/400x300?text=No+image'">
+          <h3>{p['name']}</h3>
+          <div class="small">By {p.get('farmer_name') or 'Unknown'}</div>
+          <div class="kv" style="margin-top:8px"><div class="badge">₹{float(p['price']):.2f}</div><div class="small">Stock: {p.get('quantity',0)}</div></div>
+        </div>
+        """
+    farmers_html = "".join([f"<div class='card small'>{f.get('farm_name') or ''} — {f.get('name')}</div>" for f in farmers])
+    body = f"""
+    <div class="grid">
+      <div class="card">
+        <h2>Featured Products</h2>
+        <div class="listing-grid">{cards}</div>
+      </div>
+      <div>
+        <div class="card"><h3>Featured Farmers</h3>{farmers_html}</div>
+        <div style="height:12px"></div>
+        <div class="card"><h3>Categories</h3>
+          <div class="small">Fresh Vegetables • Fruits • Grains & Cereals • Dairy • Meat & Poultry • Organic • Herbs & Spices</div>
+        </div>
+      </div>
+    </div>
+    """
+    return render_template_string(BASE_HTML, body=body, title="Home", oauth_ready=OAUTH_READY)
 
-@app.route("/marketplace")
-def marketplace():
-    q = (request.args.get("q") or "").strip()
-    category = (request.args.get("category") or "").strip()
-    organic = request.args.get("organic")
-    sort = request.args.get("sort")
+# ---------------- Marketplace: catalog, product view, search ----------------
+@app.route("/market")
+def market():
+    q = (request.args.get('q') or '').strip()
+    category = (request.args.get('category') or '').strip()
+    location = (request.args.get('location') or '').strip()
+    organic = request.args.get('organic')
+    sort = request.args.get('sort')  # price_asc, price_desc, newest
     params = []
-    base = ("SELECT l.*, u.display_name AS seller_name, COALESCE(avg_r.avg,0) AS avg_rating "
-            "FROM listings l LEFT JOIN users u ON l.seller_id = u.id "
-            "LEFT JOIN (SELECT listing_id, AVG(rating) as avg FROM ratings GROUP BY listing_id) avg_r ON l.id = avg_r.listing_id WHERE 1=1")
+    sql = "SELECT p.*, u.name as farmer_name FROM products p LEFT JOIN users u ON p.farmer_id = u.id WHERE p.status='active'"
     if q:
-        base += " AND (l.title ILIKE %s OR u.display_name ILIKE %s OR l.description ILIKE %s)"
-        p = f"%{q}%"
-        params.extend([p,p,p])
+        sql += " AND (p.name ILIKE %s OR p.description ILIKE %s OR u.name ILIKE %s)"
+        params.extend([f"%{q}%", f"%{q}%", f"%{q}%"])
     if category:
-        base += " AND l.category = %s"; params.append(category)
+        sql += " AND p.category = %s"; params.append(category)
+    if location:
+        sql += " AND p.location ILIKE %s"; params.append(f"%{location}%")
     if organic:
-        base += " AND l.is_organic = TRUE"
-    order_by = " ORDER BY l.created_at DESC"
-    if sort == "price_asc":
-        order_by = " ORDER BY l.price ASC"
-    elif sort == "price_desc":
-        order_by = " ORDER BY l.price DESC"
-    elif sort == "rating":
-        order_by = " ORDER BY avg_r.avg DESC NULLS LAST"
-    sql = base + order_by + " LIMIT 200"
-    rows = run_fetchall(sql, params)
-    if rows is None:
-        rows = []
-    for r in rows:
-        imgs = run_fetchall("SELECT image_path FROM listing_images WHERE listing_id = %s ORDER BY id", (r['id'],))
-        r['images'] = [i['image_path'] for i in imgs] if imgs else []
-        r['price'] = float(r['price']) if r.get('price') is not None else 0.0
-        r['stock'] = int(r['stock']) if r.get('stock') is not None else 0
-        r['is_organic'] = bool(r.get('is_organic'))
-        r['avg_rating'] = float(r['avg_rating']) if r.get('avg_rating') is not None else None
-    return render_template_string(MARKET_HTML, listings=rows, categories=get_categories(), q=q, category=category, organic=organic, sort=sort)
+        sql += " AND p.is_organic = TRUE"
+    if sort == 'price_asc':
+        sql += " ORDER BY p.price ASC"
+    elif sort == 'price_desc':
+        sql += " ORDER BY p.price DESC"
+    else:
+        sql += " ORDER BY p.created_at DESC"
+    sql += " LIMIT 200"
+    rows = db_fetchall(sql, tuple(params))
+    # render product cards
+    cards = ""
+    for p in rows or []:
+        imgs = db_fetchall("SELECT path FROM product_images WHERE product_id=%s ORDER BY id LIMIT 1", (p['id'],)) or []
+        img = imgs[0]['path'] if imgs else ''
+        cards += f"""
+        <div class="product-card card">
+          <img src="{url_for('uploaded_file', filename=img)}" onerror="this.src='https://via.placeholder.com/400x300?text=No+image'">
+          <h3>{p['name']}</h3>
+          <div class="small">By {p.get('farmer_name') or 'Unknown'}</div>
+          <div class="kv" style="margin-top:8px">
+            <div class="badge">₹{float(p['price']):.2f}</div>
+            <div class="small">Stock: {p.get('quantity',0)}</div>
+          </div>
+          <div style="margin-top:8px">
+            <a href="{url_for('product_view', product_id=p['id'])}">View</a>
+            <button onclick="app.addToCart({p['id']},1)" class="btn btn-secondary">Add</button>
+          </div>
+        </div>
+        """
+    body = f"""
+    <div class="card">
+      <form method="get" class="search-row">
+        <input class="input" name="q" placeholder="Search products or farmers" value="{q}">
+        <input class="input" name="location" placeholder="Location" value="{location}">
+        <select name="category" class="input">
+          <option value="">All categories</option>
+          <option value="Fresh Vegetables" {"selected" if category=="Fresh Vegetables" else ""}>Fresh Vegetables</option>
+          <option value="Fruits" {"selected" if category=="Fruits" else ""}>Fruits</option>
+          <option value="Grains & Cereals" {"selected" if category=="Grains & Cereals" else ""}>Grains & Cereals</option>
+          <option value="Dairy Products" {"selected" if category=="Dairy Products" else ""}>Dairy Products</option>
+          <option value="Meat & Poultry" {"selected" if category=="Meat & Poultry" else ""}>Meat & Poultry</option>
+          <option value="Organic Products" {"selected" if category=="Organic Products" else ""}>Organic Products</option>
+          <option value="Herbs & Spices" {"selected" if category=="Herbs & Spices" else ""}>Herbs & Spices</option>
+        </select>
+        <label class="small">Organic <input type="checkbox" name="organic" value="1" {"checked" if organic else ""}></label>
+        <select name="sort" class="input"><option value="">Newest</option><option value="price_asc" {"selected" if sort=='price_asc' else ""}>Price low→high</option><option value="price_desc" {"selected" if sort=='price_desc' else ""}>Price high→low</option></select>
+        <button class="btn">Filter</button>
+      </form>
+      <div class="listing-grid" style="margin-top:12px">{cards}</div>
+    </div>
+    """
+    return render_template_string(BASE_HTML, body=body, title="Marketplace")
 
 @app.route("/uploads/<path:filename>")
 def uploaded_file(filename):
     return send_from_directory(UPLOAD_DIR, filename)
 
-@app.route("/listing/<int:listing_id>")
-def view_listing(listing_id):
-    l = run_fetchone("SELECT l.*, u.display_name AS seller_name, u.email AS seller_email FROM listings l LEFT JOIN users u ON l.seller_id = u.id WHERE l.id = %s", (listing_id,))
-    if not l:
-        flash("Listing not found.")
-        return redirect(url_for("marketplace"))
-    imgs = run_fetchall("SELECT image_path FROM listing_images WHERE listing_id = %s ORDER BY id", (listing_id,))
-    images = [i['image_path'] for i in imgs] if imgs else []
-    seller = run_fetchone("SELECT id,email,display_name FROM users WHERE id = %s", (l['seller_id'],)) or {}
-    reviews = run_fetchall("SELECT r.*, u.display_name AS buyer_name FROM ratings r LEFT JOIN users u ON r.buyer_id = u.id WHERE r.listing_id = %s ORDER BY r.created_at DESC", (listing_id,))
-    return render_template_string(LISTING_HTML, listing=l, images=images, seller=seller, reviews=reviews)
+@app.route("/product/<int:product_id>")
+def product_view(product_id):
+    p = db_fetchone("SELECT p.*, u.name as farmer_name, u.email as farmer_email FROM products p LEFT JOIN users u ON p.farmer_id = u.id WHERE p.id = %s", (product_id,))
+    if not p:
+        flash("Product not found.")
+        return redirect(url_for('market'))
+    imgs = db_fetchall("SELECT path FROM product_images WHERE product_id = %s ORDER BY id", (product_id,)) or []
+    images_html = "".join([f'<img src="{url_for("uploaded_file", filename=i["path"])}" style="max-width:200px;margin-right:6px">' for i in imgs])
+    # reviews
+    reviews = db_fetchall("SELECT r.*, u.name as buyer_name FROM reviews r LEFT JOIN users u ON r.buyer_id = u.id WHERE r.product_id = %s ORDER BY r.created_at DESC LIMIT 50", (product_id,)) or []
+    reviews_html = "".join([f'<div class="card small">{r["buyer_name"]} — {r["rating"]}/5<br>{r["comment"]}</div>' for r in reviews])
+    body = f"""
+    <div class="grid">
+      <div class="card">
+        <div style="display:flex;gap:12px">
+          <div style="min-width:320px">{images_html or '<div style=color:#aaa>no images</div>'}</div>
+          <div>
+            <h2>{p['name']}</h2>
+            <div class="small">By {p['farmer_name']} • {p.get('category') or ''}</div>
+            <div style="margin-top:8px"><strong>₹{float(p['price']):.2f}</strong> • Stock: {p.get('quantity',0)}</div>
+            <p class="small">{p.get('description') or ''}</p>
+            <div style="margin-top:10px">
+              <button onclick="app.addToCart({p['id']},1)" class="btn">Add to cart</button>
+              {% if session.role == 'buyer' %}<a class="btn btn-secondary" href="{{ url_for('cart') }}">View Cart</a>{% endif %}
+            </div>
+          </div>
+        </div>
+      </div>
 
-# ---------------- Cart & checkout ----------------
-def get_cart():
-    return session.get("cart", {})
+      <div>
+        <div class="card"><h3>Farmer</h3><div class="small">{p.get('farmer_name')} • {p.get('location') or ''} • {p.get('is_organic') and 'Organic' or ''}</div></div>
+        <div style="height:12px"></div>
+        <div class="card"><h3>Reviews</h3>{reviews_html or '<div class=small>No reviews yet.</div>'}</div>
+      </div>
+    </div>
+    """
+    return render_template_string(BASE_HTML, body=body, title=p['name'])
 
-def save_cart(cart):
-    session['cart'] = cart
-    session.modified = True
-
-@app.route("/cart")
-def cart():
-    cart = get_cart()
-    if not cart:
-        return render_template_string(CART_HTML, cart_items=[], total=0)
-    items = []
-    total = 0.0
-    for lid_str, qty in cart.items():
-        lid = int(lid_str)
-        l = run_fetchone("SELECT id,title,price,stock FROM listings WHERE id = %s", (lid,))
-        if not l:
-            continue
-        unit = float(l['price'])
-        line = unit * int(qty)
-        total += line
-        items.append({'listing_id': l['id'], 'title': l['title'], 'price': unit, 'qty': int(qty), 'line_total': line})
-    return render_template_string(CART_HTML, cart_items=items, total=total)
-
-@app.route("/cart/add/<int:listing_id>", methods=["POST"])
-def add_to_cart(listing_id):
-    if session.get("user_role") != "buyer":
-        flash("Only buyers can add to cart.")
-        return redirect(url_for("view_listing", listing_id=listing_id))
-    qty = int(request.form.get("qty") or 1)
-    if qty < 1: qty = 1
-    cart = get_cart()
-    cart[str(listing_id)] = cart.get(str(listing_id), 0) + qty
-    save_cart(cart)
-    flash("Added to cart.")
-    return redirect(url_for("marketplace"))
-
-@app.route("/cart/remove/<int:listing_id>", methods=["POST"])
-def remove_from_cart(listing_id):
-    cart = get_cart()
-    cart.pop(str(listing_id), None)
-    save_cart(cart)
-    flash("Removed from cart.")
-    return redirect(url_for("cart"))
-
-@app.route("/checkout", methods=["POST"])
-def checkout():
-    if session.get("user_role") != "buyer":
-        flash("Only buyers can checkout.")
-        return redirect(url_for("cart"))
-    cart = get_cart()
-    if not cart:
-        flash("Cart empty.")
-        return redirect(url_for("cart"))
-    total = 0.0
-    order_items = []
-    for lid_str, qty in cart.items():
-        lid = int(lid_str)
-        l = run_fetchone("SELECT id,title,price,stock,seller_id FROM listings WHERE id = %s", (lid,))
-        if not l:
-            flash("Listing missing; update cart.")
-            return redirect(url_for("cart"))
-        if int(qty) > (l['stock'] or 0):
-            flash(f"Not enough stock for {l['title']}.")
-            return redirect(url_for("cart"))
-        unit = float(l['price'])
-        line = unit * int(qty)
-        total += line
-        order_items.append((lid, l['title'], l['seller_id'], unit, int(qty), line))
-    order_id = run_commit("INSERT INTO orders (buyer_id, total_amount, status) VALUES (%s,%s,%s) RETURNING id", (session.get("user_id"), total, "pending"), returning=True)
-    if not order_id:
-        flash("Failed to create order.")
-        return redirect(url_for("cart"))
-    for lid, title, seller_id, unit, qty, line in order_items:
-        run_commit("INSERT INTO order_items (order_id, listing_id, seller_id, listing_title, unit_price, quantity, line_total) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                   (order_id, lid, seller_id, title, unit, qty, line))
-        run_commit("UPDATE listings SET stock = GREATEST(stock - %s, 0), updated_at = CURRENT_TIMESTAMP WHERE id = %s", (qty, lid))
-    save_cart({})
-    flash("Order created. Proceed to payment (mock).")
-    return redirect(url_for("pay", order_id=order_id))
-
-@app.route("/pay/<int:order_id>", methods=["GET","POST"])
-def pay(order_id):
-    order = run_fetchone("SELECT o.*, u.email AS buyer_email FROM orders o LEFT JOIN users u ON o.buyer_id = u.id WHERE o.id = %s", (order_id,))
-    if not order:
-        flash("Order not found.")
-        return redirect(url_for("marketplace"))
-    if request.method == "POST":
-        run_commit("UPDATE orders SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s", ("paid", order_id))
-        flash("Payment successful (mock).")
-        return redirect(url_for("order_receipt", order_id=order_id))
-    return f"<h2>Mock Payment</h2><p>Order #{order_id} — Total: ₹{float(order.get('total_amount') or 0.0):.2f}</p><form method='post'><button type='submit'>Pay (mock)</button></form>"
-
-@app.route("/order/<int:order_id>/receipt")
-def order_receipt(order_id):
-    order = run_fetchone("SELECT o.*, u.email AS buyer_email, u.display_name AS buyer_name FROM orders o LEFT JOIN users u ON o.buyer_id = u.id WHERE o.id = %s", (order_id,))
-    if not order:
-        flash("Order not found.")
-        return redirect(url_for("marketplace"))
-    items = run_fetchall("SELECT * FROM order_items WHERE order_id = %s", (order_id,))
-    html = "<h2>Invoice</h2>"
-    html += f"<div>Order #{order_id}</div><div>Buyer: {order.get('buyer_name') or order.get('buyer_email')}</div>"
-    html += "<table border='1' cellpadding='6'><tr><th>Item</th><th>Qty</th><th>Unit</th><th>Line</th></tr>"
-    for it in items or []:
-        html += f"<tr><td>{it['listing_title']}</td><td>{it['quantity']}</td><td>₹{float(it['unit_price'])}</td><td>₹{float(it['line_total'])}</td></tr>"
-    html += "</table>"
-    html += f"<p>Total: ₹{float(order.get('total_amount') or 0.0):.2f}</p>"
-    html += f"<p>Status: {order.get('status')}</p>"
-    return html
-
-# ---------------- Farmer actions ----------------
+# ---------------- Farmer dashboard: manage products, orders, analytics ----------------
 @app.route("/farmer")
-@roles_required("farmer")
+@login_required
+@role_required('farmer')
 def farmer_dashboard():
-    user_id = session.get("user_id")
-    my_listings = run_fetchall("SELECT * FROM listings WHERE seller_id = %s ORDER BY created_at DESC", (user_id,))
-    return render_template_string(FARMER_HTML, my_listings=my_listings or [])
+    uid = session['user_id']
+    # products
+    products = db_fetchall("SELECT * FROM products WHERE farmer_id = %s ORDER BY created_at DESC", (uid,)) or []
+    prod_rows = ""
+    for p in products:
+        prod_rows += f"<div class='list-item'><div><strong>{p['name']}</strong><div class='small'>Stock: {p['quantity']} • ₹{float(p['price']):.2f}</div></div><div><a href='{url_for('edit_product', product_id=p['id'])}'>Edit</a></div></div>"
+    # orders
+    orders = db_fetchall("SELECT * FROM orders WHERE farmer_id = %s ORDER BY created_at DESC LIMIT 50", (uid,)) or []
+    order_rows = ""
+    for o in orders:
+        order_rows += f"<div class='list-item'><div>Order #{o['id']} • ₹{float(o['total_amount']):.2f} • {o['status']}</div><div><a href='{url_for('view_order', order_id=o['id'])}'>View</a></div></div>"
+    # simple analytics
+    total_sales = db_fetchone("SELECT COALESCE(SUM(total_amount),0) as s FROM orders WHERE farmer_id=%s AND status='completed'", (uid,))
+    total_products = db_fetchone("SELECT COUNT(*) as c FROM products WHERE farmer_id=%s", (uid,))
+    body = f"""
+    <div class="grid">
+      <div class="card">
+        <h2>Farmer Dashboard</h2>
+        <div class="small">Earnings: ₹{float(total_sales['s'] or 0):.2f} • Products: {total_products['c']}</div>
+        <h3 style="margin-top:12px">Add Product</h3>
+        <form method="post" action="{url_for('create_product')}" enctype="multipart/form-data">
+          <div class="form-row"><input class="input" name="name" placeholder="Product name" required></div>
+          <div class="form-row"><input class="input" name="category" placeholder="Category"></div>
+          <div class="form-row"><input class="input" name="price" placeholder="Price"></div>
+          <div class="form-row"><input class="input" name="unit" placeholder="Unit (kg, piece)"></div>
+          <div class="form-row"><input class="input" name="quantity" placeholder="Quantity"></div>
+          <div class="form-row"><textarea class="input" name="description" placeholder="Description"></textarea></div>
+          <div class="form-row"><label>Images (multiple)</label><input type="file" name="images" multiple></div>
+          <button class="btn">Create</button>
+        </form>
+      </div>
 
-@app.route("/listing/create", methods=["POST"])
-@roles_required("farmer")
-def create_listing():
-    title = (request.form.get("title") or "").strip()
-    category = (request.form.get("category") or "").strip()
-    description = (request.form.get("description") or "").strip()
-    try:
-        price = float(request.form.get("price") or 0.0)
-    except:
-        price = 0.0
-    try:
-        stock = int(request.form.get("stock") or 0)
-    except:
-        stock = 0
-    delivery_options = (request.form.get("delivery_options") or "").strip()
-    is_organic = bool(request.form.get("is_organic"))
-    freshness = (request.form.get("freshness") or "").strip()
-    location = (request.form.get("location") or "").strip()
-    seller_id = session.get("user_id")
-    listing_id = run_commit("INSERT INTO listings (seller_id,title,category,description,price,stock,delivery_options,is_organic,freshness,location) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-                            (seller_id, title, category, description, price, stock, delivery_options, is_organic, freshness, location), returning=True)
-    if not listing_id:
-        flash("Failed to create listing.")
-        return redirect(url_for("farmer_dashboard"))
-    files = request.files.getlist("images")
+      <div>
+        <div class="card"><h3>Your Products</h3>{prod_rows or '<div class=small>No products yet.</div>'}</div>
+        <div style="height:12px"></div>
+        <div class="card"><h3>Recent Orders</h3>{order_rows or '<div class=small>No orders yet.</div>'}</div>
+      </div>
+    </div>
+    """
+    return render_template_string(BASE_HTML, body=body, title="Farmer Dashboard")
+
+@app.route("/product/create", methods=['POST'])
+@login_required
+@role_required('farmer')
+def create_product():
+    name = request.form.get('name')
+    category = request.form.get('category')
+    price = float(request.form.get('price') or 0)
+    unit = request.form.get('unit')
+    quantity = int(request.form.get('quantity') or 0)
+    description = request.form.get('description')
+    is_organic = bool(request.form.get('is_organic'))
+    location = request.form.get('location') or session.get('user_name')
+    farmer_id = session['user_id']
+    pid = db_commit("INSERT INTO products (farmer_id,name,category,price,unit,quantity,description,is_organic,location) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (farmer_id, name, category, price, unit, quantity, description, is_organic, location), returning=True)
+    if not pid:
+        flash("Failed to create product.")
+        return redirect(url_for('farmer_dashboard'))
+    files = request.files.getlist('images')
     for f in files:
-        if f and f.filename:
-            saved = save_image(f)
-            if saved:
-                run_commit("INSERT INTO listing_images (listing_id, image_path) VALUES (%s,%s)", (listing_id, saved))
-    flash("Listing created.")
-    return redirect(url_for("farmer_dashboard"))
+        saved = save_upload(f)
+        if saved:
+            db_commit("INSERT INTO product_images (product_id, path) VALUES (%s,%s)", (pid, saved))
+    flash("Product created.")
+    return redirect(url_for('farmer_dashboard'))
 
-@app.route("/listing/<int:listing_id>/delete", methods=["POST"])
-@roles_required("farmer")
-def delete_listing(listing_id):
-    li = run_fetchone("SELECT * FROM listings WHERE id = %s", (listing_id,))
-    if not li or li.get('seller_id') != session.get("user_id"):
+@app.route("/product/<int:product_id>/edit", methods=['GET','POST'])
+@login_required
+@role_required('farmer')
+def edit_product(product_id):
+    p = db_fetchone("SELECT * FROM products WHERE id = %s", (product_id,))
+    if not p or p['farmer_id'] != session['user_id']:
         flash("Not allowed.")
-        return redirect(url_for("farmer_dashboard"))
-    imgs = run_fetchall("SELECT image_path FROM listing_images WHERE listing_id = %s", (listing_id,))
-    for i in imgs or []:
-        path = os.path.join(UPLOAD_DIR, i['image_path'])
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except:
-            pass
-    run_commit("DELETE FROM listing_images WHERE listing_id = %s", (listing_id,))
-    run_commit("DELETE FROM listings WHERE id = %s", (listing_id,))
-    flash("Listing deleted.")
-    return redirect(url_for("farmer_dashboard"))
+        return redirect(url_for('farmer_dashboard'))
+    if request.method == 'POST':
+        name = request.form.get('name')
+        price = float(request.form.get('price') or 0)
+        quantity = int(request.form.get('quantity') or 0)
+        description = request.form.get('description')
+        db_commit("UPDATE products SET name=%s, price=%s, quantity=%s, description=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s",
+                  (name, price, quantity, description, product_id))
+        files = request.files.getlist('images')
+        for f in files:
+            saved = save_upload(f)
+            if saved:
+                db_commit("INSERT INTO product_images (product_id, path) VALUES (%s,%s)", (product_id, saved))
+        flash("Product updated.")
+        return redirect(url_for('farmer_dashboard'))
+    imgs = db_fetchall("SELECT * FROM product_images WHERE product_id = %s", (product_id,)) or []
+    imgs_html = "".join([f"<div class='small'>{i['path']}</div>" for i in imgs])
+    body = f"""
+    <div class="card"><h3>Edit Product</h3>
+      <form method="post" enctype="multipart/form-data">
+        <div class="form-row"><input class="input" name="name" value="{p['name']}"></div>
+        <div class="form-row"><input class="input" name="price" value="{float(p['price']):.2f}"></div>
+        <div class="form-row"><input class="input" name="quantity" value="{p.get('quantity',0)}"></div>
+        <div class="form-row"><textarea class="input" name="description">{p.get('description') or ''}</textarea></div>
+        <div class="form-row"><label>Images</label><input type="file" name="images" multiple></div>
+        <div>{imgs_html}</div>
+        <button class="btn">Save</button>
+      </form>
+    </div>
+    """
+    return render_template_string(BASE_HTML, body=body, title="Edit Product")
 
-# ---------------- Ratings ----------------
-@app.route("/listing/<int:listing_id>/rate", methods=["POST"])
-@roles_required("buyer")
-def rate_listing(listing_id):
-    rating = int(request.form.get("rating") or 0)
-    review = (request.form.get("review") or "").strip()
-    if rating < 1 or rating > 5:
-        flash("Invalid rating.")
-        return redirect(url_for("view_listing", listing_id=listing_id))
-    run_commit("INSERT INTO ratings (listing_id, buyer_id, rating, review) VALUES (%s,%s,%s,%s)",
-               (listing_id, session.get("user_id"), rating, review))
+# ---------------- Buyer: cart (client-side), checkout (mock), orders, reviews ----------------
+@app.route("/cart")
+@login_required
+@role_required('buyer')
+def cart():
+    # server will not store cart (client localStorage). Provide sync endpoints to persist optional server-side cart
+    body = """
+    <div class="card">
+      <h2>Your Cart</h2>
+      <p class="small">This demo uses client-side cart stored in your browser. On checkout we create an order using current cart state.</p>
+      <div style="margin:12px 0">
+        <button onclick="syncAndCheckout()" class="btn">Proceed to Checkout (mock)</button>
+      </div>
+      <div id="cart-contents"></div>
+    </div>
+    <script>
+    function renderCart(){
+      const c = JSON.parse(localStorage.getItem('cart_v1')||'{}');
+      const container = document.getElementById('cart-contents');
+      if(!Object.keys(c).length){ container.innerHTML='<div class=small>Your cart is empty.</div>'; return; }
+      let html = '<table border=1 cellpadding=6 style="width:100%"><tr><th>Item</th><th>Qty</th><th>Action</th></tr>';
+      const ids = Object.keys(c);
+      fetch('/api/products/batch', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids:ids})
+      }).then(r=>r.json()).then(data=>{
+        let total=0;
+        for(const it of data){
+          const qty = c[it.id];
+          html += '<tr><td>'+it.name+'</td><td>'+qty+'</td><td><button onclick="remove('+it.id+')">Remove</button></td></tr>';
+          total += parseFloat(it.price||0)*qty;
+        }
+        html += '</table><h3>Total: ₹'+total.toFixed(2)+'</h3>';
+        container.innerHTML = html;
+      });
+    }
+    function remove(id){ const c=JSON.parse(localStorage.getItem('cart_v1')||'{}'); delete c[id]; localStorage.setItem('cart_v1',JSON.stringify(c)); renderCart(); }
+    function syncAndCheckout(){
+      const c = JSON.parse(localStorage.getItem('cart_v1')||'{}');
+      if(!Object.keys(c).length){ alert('Cart empty'); return; }
+      fetch('/checkout', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({cart:c})}).then(r=>r.json()).then(j=>{
+        if(j.ok){ localStorage.removeItem('cart_v1'); alert('Order created: '+j.order_id); window.location='/orders'; } else alert('Error: '+(j.error||'unknown')) ;
+      });
+    }
+    renderCart();
+    </script>
+    """
+    return render_template_string(BASE_HTML, body=body, title="Cart")
+
+@app.route("/api/products/batch", methods=['POST'])
+def api_products_batch():
+    data = request.get_json() or {}
+    ids = data.get('ids') or []
+    if not ids:
+        return jsonify([])
+    # sanitize ids as ints
+    clean = [int(x) for x in ids]
+    rows = db_fetchall("SELECT id,name,price FROM products WHERE id = ANY(%s)", (clean,))
+    return jsonify(rows or [])
+
+@app.route("/checkout", methods=['POST'])
+@login_required
+@role_required('buyer')
+def checkout_api():
+    data = request.get_json() or {}
+    cart = data.get('cart') or {}
+    if not cart:
+        return jsonify({'ok': False, 'error': 'Cart empty'}), 400
+    # build order per farmer: group by farmer_id
+    items = []
+    product_ids = [int(k) for k in cart.keys()]
+    prods = db_fetchall("SELECT * FROM products WHERE id = ANY(%s)", (product_ids,)) or []
+    prod_map = {p['id']: p for p in prods}
+    # group by farmer
+    groups = {}
+    total_amount = 0
+    for pid_str, qty in cart.items():
+        pid = int(pid_str)
+        p = prod_map.get(pid)
+        if not p:
+            continue
+        farmer_id = p['farmer_id']
+        line = float(p['price'] or 0) * int(qty)
+        total_amount += line
+        groups.setdefault(farmer_id, []).append((pid, int(qty), float(p['price'] or 0)))
+    created_orders = []
+    for farmer_id, items_list in groups.items():
+        # create order
+        order_id = db_commit("INSERT INTO orders (buyer_id, farmer_id, total_amount, status) VALUES (%s,%s,%s,%s) RETURNING id",
+                             (session['user_id'], farmer_id, sum(q*price for (_,q,price) in items_list), 'pending'), returning=True)
+        if not order_id:
+            continue
+        for pid, qty, price in items_list:
+            db_commit("INSERT INTO order_items (order_id, product_id, quantity, price) VALUES (%s,%s,%s,%s)", (order_id, pid, qty, price))
+            # decrement stock
+            db_commit("UPDATE products SET quantity = GREATEST(quantity - %s, 0) WHERE id = %s", (qty, pid))
+        created_orders.append(order_id)
+    if not created_orders:
+        return jsonify({'ok': False, 'error': 'Failed to create orders'}), 500
+    return jsonify({'ok': True, 'order_id': created_orders[0], 'orders': created_orders})
+
+@app.route("/orders")
+@login_required
+def orders():
+    uid = session['user_id']
+    if session['role']=='buyer':
+        rows = db_fetchall("SELECT * FROM orders WHERE buyer_id = %s ORDER BY created_at DESC", (uid,)) or []
+    elif session['role']=='farmer':
+        rows = db_fetchall("SELECT * FROM orders WHERE farmer_id = %s ORDER BY created_at DESC", (uid,)) or []
+    else:
+        rows = db_fetchall("SELECT * FROM orders ORDER BY created_at DESC LIMIT 200") or []
+    rows_html = ""
+    for o in rows:
+        rows_html += f"<div class='list-item'><div>Order #{o['id']} • ₹{float(o['total_amount']):.2f} • {o['status']}</div><div><a href='{url_for('view_order', order_id=o['id'])}'>View</a></div></div>"
+    body = f"<div class='card'><h2>Your Orders</h2>{rows_html or '<div class=small>No orders found.</div>'}</div>"
+    return render_template_string(BASE_HTML, body=body, title="Orders")
+
+@app.route("/order/<int:order_id>")
+@login_required
+def view_order(order_id):
+    o = db_fetchone("SELECT * FROM orders WHERE id = %s", (order_id,))
+    if not o:
+        flash("Order not found.")
+        return redirect(url_for('orders'))
+    items = db_fetchall("SELECT oi.*, p.name FROM order_items oi LEFT JOIN products p ON oi.product_id = p.id WHERE oi.order_id = %s", (order_id,)) or []
+    items_html = "".join([f"<div class='small'>{it['name']} • {it['quantity']} x ₹{float(it['price']):.2f}</div>" for it in items])
+    # allow farmer to update status
+    update_btn = ""
+    if session['role']=='farmer' and o['farmer_id']==session['user_id']:
+        update_btn = f"""
+        <form method="post" action="{url_for('update_order_status', order_id=order_id)}">
+          <select name="status" class="input"><option>pending</option><option>confirmed</option><option>packed</option><option>delivered</option></select>
+          <button class="btn">Update status</button>
+        </form>
+        """
+    body = f"<div class='card'><h2>Order #{o['id']}</h2><div class='small'>Total ₹{float(o['total_amount']):.2f} • Status: {o['status']}</div><div style='margin-top:12px'>{items_html}</div>{update_btn}</div>"
+    return render_template_string(BASE_HTML, body=body, title=f"Order {order_id}")
+
+@app.route("/order/<int:order_id>/status", methods=['POST'])
+@login_required
+@role_required('farmer')
+def update_order_status(order_id):
+    new = request.form.get('status')
+    if new not in ('pending','confirmed','packed','delivered','cancelled'):
+        flash("Invalid status.")
+        return redirect(url_for('view_order', order_id=order_id))
+    db_commit("UPDATE orders SET status=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s", (new, order_id))
+    flash("Status updated.")
+    return redirect(url_for('view_order', order_id=order_id))
+
+@app.route("/review/<int:product_id>", methods=['POST'])
+@login_required
+@role_required('buyer')
+def post_review(product_id):
+    rating = int(request.form.get('rating') or 0)
+    comment = request.form.get('comment') or ''
+    prod = db_fetchone("SELECT * FROM products WHERE id = %s", (product_id,))
+    if not prod:
+        flash("Product missing.")
+        return redirect(url_for('market'))
+    db_commit("INSERT INTO reviews (buyer_id, farmer_id, product_id, rating, comment) VALUES (%s,%s,%s,%s,%s)", (session['user_id'], prod['farmer_id'], product_id, rating, comment))
     flash("Thanks for your review.")
-    return redirect(url_for("view_listing", listing_id=listing_id))
+    return redirect(url_for('product_view', product_id=product_id))
+
+# ---------------- Messaging ----------------
+@app.route("/messages", methods=['GET','POST'])
+@login_required
+def messages():
+    if request.method=='POST':
+        to = int(request.form.get('to'))
+        subject = request.form.get('subject')
+        body = request.form.get('body')
+        db_commit("INSERT INTO messages (sender_id, receiver_id, subject, body) VALUES (%s,%s,%s,%s)", (session['user_id'], to, subject, body))
+        flash("Message sent.")
+        return redirect(url_for('messages'))
+    # show inbox
+    inbox = db_fetchall("SELECT m.*, u.name as sender_name FROM messages m LEFT JOIN users u ON m.sender_id = u.id WHERE m.receiver_id = %s ORDER BY m.created_at DESC", (session['user_id'],)) or []
+    rows = "".join([f"<div class='list-item'><div><strong>{r['subject']}</strong><div class='small'>From {r['sender_name']} • {r['created_at']}</div></div></div>" for r in inbox])
+    body = f"<div class='card'><h2>Messages</h2>{rows}</div>"
+    return render_template_string(BASE_HTML, body=body, title="Messages")
 
 # ---------------- Admin ----------------
 @app.route("/admin")
-@roles_required("admin")
-def admin_dashboard():
-    users = run_fetchall("SELECT id,email,display_name,role FROM users ORDER BY id DESC")
-    orders = run_fetchall("SELECT o.*, u.email as buyer_email FROM orders o LEFT JOIN users u ON o.buyer_id = u.id ORDER BY o.created_at DESC LIMIT 100")
-    return render_template_string(ADMIN_HTML, users=users or [], orders=orders or [])
+@login_required
+@role_required('admin')
+def admin():
+    users = db_fetchall("SELECT * FROM users ORDER BY id DESC") or []
+    orders = db_fetchall("SELECT * FROM orders ORDER BY created_at DESC LIMIT 100") or []
+    users_html = "".join([f"<div class='list-item'><div>{u['email']} • {u.get('role')}</div><div><form method='post' action='{url_for('admin_change_role', user_id=u['id'])}'><select name='role'><option value='buyer' {'selected' if u.get('role')=='buyer' else ''}>buyer</option><option value='farmer' {'selected' if u.get('role')=='farmer' else ''}>farmer</option><option value='admin' {'selected' if u.get('role')=='admin' else ''}>admin</option></select><button class='btn btn-secondary'>Change</button></form></div></div>" for u in users])
+    orders_html = "".join([f"<div class='list-item'><div>Order #{o['id']} • {o['status']}</div></div>" for o in orders])
+    body = f"<div class='grid'><div class='card'><h3>Users</h3>{users_html}</div><div class='card'><h3>Recent Orders</h3>{orders_html}</div></div>"
+    return render_template_string(BASE_HTML, body=body, title="Admin")
 
-@app.route("/admin/user/<int:user_id>/change_role", methods=["POST"])
-@roles_required("admin")
+@app.route("/admin/user/<int:user_id>/role", methods=['POST'])
+@login_required
+@role_required('admin')
 def admin_change_role(user_id):
-    new_role = request.form.get("role")
-    if new_role not in ("buyer","farmer","admin"):
-        flash("Invalid role.")
-        return redirect(url_for("admin_dashboard"))
-    run_commit("UPDATE users SET role = %s WHERE id = %s", (new_role, user_id))
+    new = request.form.get('role')
+    db_commit("UPDATE users SET role=%s WHERE id=%s", (new, user_id))
     flash("Role updated.")
-    return redirect(url_for("admin_dashboard"))
+    return redirect(url_for('admin'))
 
-@app.route("/admin/order/<int:order_id>/update", methods=["POST"])
-@roles_required("admin")
-def admin_update_order(order_id):
-    status = request.form.get("status")
-    if status not in ("pending","paid","shipped","completed","cancelled"):
-        flash("Invalid status.")
-        return redirect(url_for("admin_dashboard"))
-    run_commit("UPDATE orders SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s", (status, order_id))
-    flash("Order updated.")
-    return redirect(url_for("admin_dashboard"))
+# ---------------- API: basic endpoints for front-end JS if needed ----------------
+@app.route("/api/products/<int:product_id>/images")
+def api_product_images(product_id):
+    imgs = db_fetchall("SELECT path FROM product_images WHERE product_id=%s ORDER BY id", (product_id,)) or []
+    return jsonify(imgs)
 
-# ---------------- Simple APIs ----------------
-@app.route("/api/me")
-def api_me():
-    if not session.get("user_id"):
-        return jsonify({"error":"unauthenticated"}), 401
-    return jsonify({"id":session.get("user_id"),"email":session.get("user_email"),"role":session.get("user_role")})
-
-@app.route("/api/listings")
-def api_listings():
-    rows = run_fetchall("SELECT * FROM listings ORDER BY created_at DESC LIMIT 200")
-    return jsonify(rows or [])
+@app.route("/health")
+def health():
+    ok = db_fetchone("SELECT 1 as ok")
+    return jsonify({'status':'ok' if ok else 'db-error', 'time': datetime.utcnow().isoformat()})
 
 # ---------------- Run ----------------
 if __name__ == "__main__":
-    # For local testing only; in production use gunicorn (Procfile)
+    logger.info("Starting app on port %s", PORT)
+    # For local testing you must set APP_BASE_URL to http://localhost:3000 for OAuth redirect building.
     app.run(host="0.0.0.0", port=PORT, debug=True)
