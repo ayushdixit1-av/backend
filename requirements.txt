@@ -1,4 +1,5 @@
 flask
+Flask-WTF
 Werkzeug
 flask-cors
 psycopg2-binary
