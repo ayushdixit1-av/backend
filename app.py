@@ -14,6 +14,7 @@ import yfinance as yf
 # DB
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
+import certifi  # <- important for Railway/SSL
 
 # ================== CONFIG ==================
 init(autoreset=True)
@@ -23,17 +24,14 @@ YF_TICKER = "ITC.NS"
 CAPITAL = 5000
 STOP_PCT = 0.002      # 0.2%
 TARGET_PCT = 0.006    # 0.6%
-TICK_INTERVAL = 3     # seconds
+TICK_INTERVAL = 3
 BROKERAGE = 40
 TAXES = 9
 SCORE_ENTRY = 0.30
 MIN_BARS_FOR_INDICATORS = 60
 
-# —— Use your DSN directly (you can still override with env DB_URL) ——
-DB_URL = os.getenv(
-    "DB_URL",
-    "postgresql://neondb_owner:npg_jgROvpDtrm03@ep-hidden-truth-aev5l7a7-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-)
+# ---- DB URL: MUST come from Railway env var (no hardcoded fallback) ----
+DB_URL = os.getenv("DB_URL")  # set this in Railway → Variables
 
 # ================== GLOBAL STATE ==================
 STATE = {
@@ -49,7 +47,7 @@ STATE = {
 MEM_TRADES = []
 
 DB_ENABLED = False
-POOL: SimpleConnectionPool | None = None
+POOL = None
 
 # ================== DB SETUP ==================
 def _mask_url(url: str) -> str:
@@ -64,58 +62,107 @@ def _mask_url(url: str) -> str:
     except Exception:
         return "****"
 
-def db_init():
-    """Create pool, verify connection with SELECT 1, ensure table. Else fall back to memory."""
-    global DB_ENABLED, POOL
+def _pool_try(dsn: str, note: str):
+    """Try to make a pool with strong SSL hints; return (pool|None, error|None, note)."""
     try:
-        print(Fore.CYAN + f"DB_URL → {_mask_url(DB_URL)}")
-
-        # psycopg2 reads sslmode & channel_binding from the DSN query params already.
-        # We add a few safe defaults via kwargs too.
-        POOL = SimpleConnectionPool(
-            minconn=1,
-            maxconn=5,
-            dsn=DB_URL,
+        pool = SimpleConnectionPool(
+            1, 5,
+            dsn=dsn,
             connect_timeout=10,
-            keepalives=1,
-            keepalives_idle=30,
-            keepalives_interval=10,
-            keepalives_count=5,
+            sslmode="require",
+            sslrootcert=certifi.where(),
+            keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5,
             options="-c client_encoding=UTF8",
         )
-
         # Sanity check
-        conn = POOL.getconn()
+        conn = pool.getconn()
         cur = conn.cursor()
         cur.execute("SELECT 1;")
         cur.fetchone()
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id SERIAL PRIMARY KEY,
-            time TIMESTAMP DEFAULT NOW(),
-            symbol TEXT,
-            qty INTEGER,
-            entry FLOAT,
-            exit FLOAT,
-            gross FLOAT,
-            net FLOAT,
-            reason TEXT
-        );
-        """)
-        conn.commit()
         cur.close()
-        POOL.putconn(conn)
-
-        DB_ENABLED = True
-        STATE["last_error"] = ""
-        print(Fore.GREEN + "✅ Neon DB connected and verified (SELECT 1).")
-
+        pool.putconn(conn)
+        return pool, None, note
     except Exception as e:
-        DB_ENABLED = False
-        msg = f"DB connect failed → {e}"
+        return None, f"[{note}] {e}", note
+
+def db_init():
+    """Connect to Neon with retries across DSN variants; else fall back to memory."""
+    global DB_ENABLED, POOL
+
+    if not DB_URL:
+        msg = "DB_URL env var is missing. Set it in Railway → Variables."
         STATE["last_error"] = msg
-        print(Fore.YELLOW + f"⚠️  {msg}\nFalling back to in-memory ledger.")
+        print(Fore.YELLOW + "⚠️  " + msg)
+        DB_ENABLED = False
+        return
+
+    print(Fore.CYAN + f"DB_URL (masked): {_mask_url(DB_URL)}")
+
+    # A) as-is
+    dsn_a = DB_URL.strip()
+
+    # B) remove channel_binding param if present
+    if "channel_binding=" in dsn_a.lower():
+        base, q = dsn_a.split("?", 1)
+        kv = [p for p in q.split("&") if not p.lower().startswith("channel_binding=")]
+        dsn_b = base + ("?" + "&".join(kv) if kv else "")
+    else:
+        dsn_b = dsn_a
+
+    # C) also force gssencmode=disable (fixes some libpq builds)
+    if "gssencmode=" not in dsn_b.lower():
+        sep = "&" if "?" in dsn_b else "?"
+        dsn_c = f"{dsn_b}{sep}gssencmode=disable"
+    else:
+        dsn_c = dsn_b
+
+    attempts = [
+        (dsn_a, "A: as-is"),
+        (dsn_b, "B: no channel_binding"),
+        (dsn_c, "C: no channel_binding + gssencmode=disable"),
+    ]
+
+    errors = []
+    for dsn, note in attempts:
+        print(Fore.CYAN + f"🔌 DB attempt {note} → {_mask_url(dsn)}")
+        pool, err, which = _pool_try(dsn, note)
+        if pool:
+            print(Fore.GREEN + f"✅ Connected using attempt {which}")
+            # ensure table
+            try:
+                conn = pool.getconn()
+                cur = conn.cursor()
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
+                    id SERIAL PRIMARY KEY,
+                    time TIMESTAMP DEFAULT NOW(),
+                    symbol TEXT,
+                    qty INTEGER,
+                    entry FLOAT,
+                    exit FLOAT,
+                    gross FLOAT,
+                    net FLOAT,
+                    reason TEXT
+                );
+                """)
+                conn.commit()
+                cur.close()
+                pool.putconn(conn)
+            except Exception as e:
+                STATE["last_error"] = f"Table init failed: {e}"
+                print(Fore.YELLOW + "⚠️  " + STATE["last_error"])
+            # success
+            globals()["POOL"] = pool
+            globals()["DB_ENABLED"] = True
+            STATE["last_error"] = ""
+            return
+        else:
+            errors.append(err)
+            print(Fore.YELLOW + f"⚠️  {err}")
+
+    DB_ENABLED = False
+    STATE["last_error"] = "All DB attempts failed:\n" + "\n".join(errors)
+    print(Fore.RED + "❌ " + STATE["last_error"])
 
 def db_save_trade(symbol, qty, entry, exitp, gross, net, reason):
     if DB_ENABLED and POOL:
@@ -170,7 +217,7 @@ def db_total_profit():
             print(Fore.YELLOW + f"⚠️  DB sum failed, using memory. Reason: {e}")
     return float(sum(t["net"] for t in MEM_TRADES))
 
-# ================== PRICE & STRATEGY ==================
+# ================== PRICE FETCHER ==================
 _last_cached_price = None
 _last_yf_ts = 0.0
 
@@ -205,6 +252,7 @@ def get_live_price():
         _last_cached_price = p
     return _last_cached_price
 
+# ================== STRATEGY ==================
 def zerodha_fees(buy_value, sell_value):
     return float(BROKERAGE + TAXES)
 
@@ -271,7 +319,6 @@ def trading_bot():
             STATE["last_score"] = score
             STATE["bars_collected"] = len(closes)
 
-            # Entry
             if not position and signal == "BUY" and score >= SCORE_ENTRY:
                 qty = int(CAPITAL // price)
                 if qty >= 1:
@@ -289,7 +336,6 @@ def trading_bot():
                     }
                     print(Fore.GREEN + f"🟢 ENTRY: BUY {qty} @ ₹{price:.2f} | SL ₹{position['sl']:.2f} | TP ₹{position['tp']:.2f}")
 
-            # Exit
             elif position:
                 exit_reason = None
                 if price <= position["sl"]:
@@ -314,7 +360,6 @@ def trading_bot():
                     position = None
                     STATE["position"] = None
 
-            # Status
             STATE["total_profit"] = db_total_profit()
             print(
                 Fore.WHITE + f"⏰ {datetime.now().strftime('%H:%M:%S')} | "
@@ -450,8 +495,8 @@ refresh();
 """
     return Response(html, mimetype="text/html")
 
-# ================== RUN ==================
+# ================== RUN BOTH ==================
 if __name__ == "__main__":
     Thread(target=trading_bot, daemon=True).start()
-    port = int(os.getenv("PORT", "8080"))
+    port = int(os.getenv("PORT", "8080"))  # Railway usually binds 8080
     app.run(host="0.0.0.0", port=port)
