@@ -18,67 +18,78 @@ from psycopg2.pool import SimpleConnectionPool
 # ================== CONFIG ==================
 init(autoreset=True)
 
-SYMBOL = "ITC"         # NSE symbol
-YF_TICKER = "ITC.NS"   # Yahoo Finance ticker
-CAPITAL = 5000         # fake per-trade capital
-STOP_PCT = 0.002       # -0.2%
-TARGET_PCT = 0.006     # +0.6%
-TICK_INTERVAL = 3      # seconds between polls
-BROKERAGE = 40         # Zerodha approx fixed (buy+sell)
-TAXES = 9              # approx others combined
-SCORE_ENTRY = 0.30     # min score to enter long
+SYMBOL = "ITC"
+YF_TICKER = "ITC.NS"
+CAPITAL = 5000
+STOP_PCT = 0.002      # 0.2%
+TARGET_PCT = 0.006    # 0.6%
+TICK_INTERVAL = 3     # seconds
+BROKERAGE = 40
+TAXES = 9
+SCORE_ENTRY = 0.30
 MIN_BARS_FOR_INDICATORS = 60
 
-# Neon Postgres (set DB_URL env var on Railway)
+# —— Use your DSN directly (you can still override with env DB_URL) ——
 DB_URL = os.getenv(
     "DB_URL",
-    # Fallback ONLY for local testing; on Railway use a Variable
-    "postgresql://neondb_owner:CHANGE_ME@ep-your-pooler-host.neon.tech/neondb?sslmode=require"
+    "postgresql://neondb_owner:npg_jgROvpDtrm03@ep-hidden-truth-aev5l7a7-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 )
 
 # ================== GLOBAL STATE ==================
 STATE = {
     "live_price": None,
-    "position": None,         # dict or None
+    "position": None,
     "daily_profit": 0.0,
     "total_profit": 0.0,
     "last_error": "",
     "last_signal": "HOLD",
     "last_score": 0.0,
-    "bars_collected": 0
+    "bars_collected": 0,
 }
-MEM_TRADES = []  # in-memory ledger if DB not available
+MEM_TRADES = []
+
+DB_ENABLED = False
+POOL: SimpleConnectionPool | None = None
 
 # ================== DB SETUP ==================
-DB_ENABLED = False
-POOL = None
-
 def _mask_url(url: str) -> str:
-    if not url:
-        return "None"
-    # mask password between ':' and '@'
+    if not url: return "None"
     try:
         head, tail = url.split("://", 1)
-        if "@" in tail and ":" in tail.split("@",1)[0]:
+        if "@" in tail and ":" in tail.split("@", 1)[0]:
             creds, rest = tail.split("@", 1)
-            user, pwd = creds.split(":", 1)
+            user, _pwd = creds.split(":", 1)
             return f"{head}://{user}:****@{rest}"
         return f"{head}://****"
     except Exception:
         return "****"
 
 def db_init():
-    """Create connection pool and ensure table exists; fall back to memory on failure."""
+    """Create pool, verify connection with SELECT 1, ensure table. Else fall back to memory."""
     global DB_ENABLED, POOL
     try:
-        present = "yes" if DB_URL else "no"
-        print(Fore.CYAN + f"DB_URL present? {present} | {_mask_url(DB_URL)}")
+        print(Fore.CYAN + f"DB_URL → {_mask_url(DB_URL)}")
 
-        # Force SSL even if not in the URL (harmless when present)
-        POOL = SimpleConnectionPool(1, 5, DB_URL, sslmode="require")
+        # psycopg2 reads sslmode & channel_binding from the DSN query params already.
+        # We add a few safe defaults via kwargs too.
+        POOL = SimpleConnectionPool(
+            minconn=1,
+            maxconn=5,
+            dsn=DB_URL,
+            connect_timeout=10,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
+            options="-c client_encoding=UTF8",
+        )
 
+        # Sanity check
         conn = POOL.getconn()
         cur = conn.cursor()
+        cur.execute("SELECT 1;")
+        cur.fetchone()
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id SERIAL PRIMARY KEY,
@@ -95,14 +106,16 @@ def db_init():
         conn.commit()
         cur.close()
         POOL.putconn(conn)
+
         DB_ENABLED = True
         STATE["last_error"] = ""
-        print(Fore.GREEN + "✅ Neon DB connected.")
+        print(Fore.GREEN + "✅ Neon DB connected and verified (SELECT 1).")
+
     except Exception as e:
         DB_ENABLED = False
-        msg = f"DB connect failed: {e}"
+        msg = f"DB connect failed → {e}"
         STATE["last_error"] = msg
-        print(Fore.YELLOW + f"⚠️  {msg}\nUsing in-memory ledger.")
+        print(Fore.YELLOW + f"⚠️  {msg}\nFalling back to in-memory ledger.")
 
 def db_save_trade(symbol, qty, entry, exitp, gross, net, reason):
     if DB_ENABLED and POOL:
@@ -118,9 +131,8 @@ def db_save_trade(symbol, qty, entry, exitp, gross, net, reason):
             POOL.putconn(conn)
             return
         except Exception as e:
-            print(Fore.YELLOW + f"⚠️  DB insert failed, falling back to memory. Reason: {e}")
+            print(Fore.YELLOW + f"⚠️  DB insert failed, using memory. Reason: {e}")
 
-    # Fallback: memory
     MEM_TRADES.append({
         "time": datetime.now(),
         "symbol": symbol,
@@ -141,7 +153,6 @@ def db_get_trades():
             return df
         except Exception as e:
             print(Fore.YELLOW + f"⚠️  DB read failed, using memory. Reason: {e}")
-    # memory fallback
     if not MEM_TRADES:
         return pd.DataFrame(columns=["time","symbol","qty","entry","exit","gross","net","reason"])
     return pd.DataFrame(MEM_TRADES)
@@ -159,23 +170,19 @@ def db_total_profit():
             print(Fore.YELLOW + f"⚠️  DB sum failed, using memory. Reason: {e}")
     return float(sum(t["net"] for t in MEM_TRADES))
 
-# ================== PRICE FETCHER ==================
+# ================== PRICE & STRATEGY ==================
 _last_cached_price = None
 _last_yf_ts = 0.0
 
 def get_price_nse():
-    """Try NSE live via nsepython."""
     try:
         data = nse_eq(SYMBOL)
         val = data.get("lastPrice")
-        if val is None:
-            return None
-        return float(val)
+        return float(val) if val is not None else None
     except Exception:
         return None
 
 def get_price_yf():
-    """Fallback: Yahoo Finance (near-real-time, often 1-2 min delay)."""
     global _last_yf_ts, _last_cached_price
     try:
         now = time.time()
@@ -185,13 +192,11 @@ def get_price_yf():
         df = yf.download(YF_TICKER, period="1d", interval="1m", progress=False, auto_adjust=True)
         if df is None or df.empty:
             return None
-        price = float(df["Close"].dropna().iloc[-1])
-        return price
+        return float(df["Close"].dropna().iloc[-1])
     except Exception:
         return None
 
 def get_live_price():
-    """Robust fetcher: NSE -> Yahoo -> last cached."""
     global _last_cached_price
     p = get_price_nse()
     if p is None:
@@ -200,26 +205,21 @@ def get_live_price():
         _last_cached_price = p
     return _last_cached_price
 
-# ================== STRATEGY ==================
 def zerodha_fees(buy_value, sell_value):
-    # Simple flat model
     return float(BROKERAGE + TAXES)
 
 def calc_indicators(closes):
     df = pd.DataFrame(closes, columns=["Close"])
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
-
     delta = df["Close"].diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
     rs = (up.rolling(14).mean() / down.rolling(14).mean()).replace([np.inf, -np.inf], np.nan)
     df["RSI14"] = 100 - (100 / (1 + rs))
-
     ma = df["Close"].rolling(20).mean()
     sd = df["Close"].rolling(20).std()
     df["BB_Mid"], df["BB_Up"], df["BB_Lo"] = ma, ma + 2*sd, ma - 2*sd
-
     df.fillna(method="bfill", inplace=True)
     df.fillna(method="ffill", inplace=True)
     return df.iloc[-1]
@@ -231,14 +231,11 @@ def decide_signal(row):
         1 if row["Close"] > row["BB_Mid"] else -1 if row["Close"] < row["BB_Mid"] else 0,
     ]
     score = float(np.mean(votes))
-    if score > 0.25:
-        return "BUY", score
-    elif score < -0.25:
-        return "SELL", score
-    else:
-        return "HOLD", score
+    if score > 0.25: return "BUY", score
+    if score < -0.25: return "SELL", score
+    return "HOLD", score
 
-# ================== TRADING BOT LOOP ==================
+# ================== BOT LOOP ==================
 def trading_bot():
     print(Fore.CYAN + "\n🚀 Starting ITC Live Algo (Neon + Flask)")
     print(Fore.YELLOW + "=" * 80)
@@ -261,7 +258,7 @@ def trading_bot():
             STATE["live_price"] = float(price)
             closes.append(float(price))
             if len(closes) > 2000:
-                closes = closes[-1000:]  # keep memory small
+                closes = closes[-1000:]
 
             if len(closes) < MIN_BARS_FOR_INDICATORS:
                 STATE["bars_collected"] = len(closes)
@@ -274,7 +271,7 @@ def trading_bot():
             STATE["last_score"] = score
             STATE["bars_collected"] = len(closes)
 
-            # ENTRY (long-only)
+            # Entry
             if not position and signal == "BUY" and score >= SCORE_ENTRY:
                 qty = int(CAPITAL // price)
                 if qty >= 1:
@@ -291,10 +288,8 @@ def trading_bot():
                         "since": position["time"].strftime("%H:%M:%S")
                     }
                     print(Fore.GREEN + f"🟢 ENTRY: BUY {qty} @ ₹{price:.2f} | SL ₹{position['sl']:.2f} | TP ₹{position['tp']:.2f}")
-                else:
-                    print(Fore.YELLOW + "ℹ️  Not enough capital to buy 1 share at current price.")
 
-            # EXIT (SL/TP)
+            # Exit
             elif position:
                 exit_reason = None
                 if price <= position["sl"]:
@@ -309,21 +304,18 @@ def trading_bot():
                     fees = zerodha_fees(buy_val, sell_val)
                     net = gross - fees
 
-                    # Update state profits
-                    STATE["daily_profit"] = float(STATE["daily_profit"] + net)
+                    STATE["daily_profit"] += net
                     total = db_total_profit()
-                    STATE["total_profit"] = float(total + net)
+                    STATE["total_profit"] = total + net
 
-                    # Save trade
                     db_save_trade(SYMBOL, position["qty"], position["entry"], price, gross, net, exit_reason)
 
                     print((Fore.RED if net < 0 else Fore.GREEN) + f"🔚 EXIT: {exit_reason} @ ₹{price:.2f} | Net ₹{net:.2f} (gross {gross:.2f}, fees {fees:.2f})")
                     position = None
                     STATE["position"] = None
 
-            # Status line
-            total_in_db = db_total_profit()
-            STATE["total_profit"] = float(total_in_db)
+            # Status
+            STATE["total_profit"] = db_total_profit()
             print(
                 Fore.WHITE + f"⏰ {datetime.now().strftime('%H:%M:%S')} | "
                 f"💰 Price ₹{price:.2f} | "
@@ -341,13 +333,11 @@ def trading_bot():
             print(Fore.RED + f"❌ Loop error: {e}")
             time.sleep(TICK_INTERVAL)
 
-# ================== FLASK APP ==================
+# ================== FLASK ==================
 app = Flask(__name__)
 
 @app.route("/api/status")
 def api_status():
-    # compose a safe status payload
-    safe_pos = STATE["position"] if STATE["position"] else None
     return jsonify({
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "price": STATE["live_price"],
@@ -356,7 +346,7 @@ def api_status():
         "daily_profit": round(float(STATE["daily_profit"]), 2),
         "total_profit": round(float(STATE["total_profit"]), 2),
         "bars_collected": STATE["bars_collected"],
-        "position": safe_pos,
+        "position": STATE["position"] if STATE["position"] else None,
         "error": STATE["last_error"],
         "db_enabled": DB_ENABLED,
     })
@@ -370,7 +360,6 @@ def api_trades():
 
 @app.route("/")
 def dashboard():
-    # Minimal HTML with JS polling (no templates required)
     html = f"""
 <!DOCTYPE html>
 <html>
@@ -461,10 +450,8 @@ refresh();
 """
     return Response(html, mimetype="text/html")
 
-# ================== RUN BOTH ==================
+# ================== RUN ==================
 if __name__ == "__main__":
-    # start trading bot in background
     Thread(target=trading_bot, daemon=True).start()
-    # run flask (Railway uses PORT env)
-    port = int(os.getenv("PORT", "8080"))  # gunicorn typically binds 8080 on Railway
+    port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
