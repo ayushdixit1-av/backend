@@ -1,9 +1,8 @@
 import os
 import time
-import math
 import pandas as pd
 import numpy as np
-from datetime import datetime, date
+from datetime import datetime
 from threading import Thread
 from flask import Flask, jsonify, Response
 from colorama import Fore, Style, init
@@ -33,7 +32,8 @@ MIN_BARS_FOR_INDICATORS = 60
 # Neon Postgres (set DB_URL env var on Railway)
 DB_URL = os.getenv(
     "DB_URL",
-    "postgresql://neondb_owner:npg_jgROvpDtrm03@ep-hidden-truth-aev5l7a7-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
+    # Fallback ONLY for local testing; on Railway use a Variable
+    "postgresql://neondb_owner:CHANGE_ME@ep-your-pooler-host.neon.tech/neondb?sslmode=require"
 )
 
 # ================== GLOBAL STATE ==================
@@ -53,11 +53,30 @@ MEM_TRADES = []  # in-memory ledger if DB not available
 DB_ENABLED = False
 POOL = None
 
+def _mask_url(url: str) -> str:
+    if not url:
+        return "None"
+    # mask password between ':' and '@'
+    try:
+        head, tail = url.split("://", 1)
+        if "@" in tail and ":" in tail.split("@",1)[0]:
+            creds, rest = tail.split("@", 1)
+            user, pwd = creds.split(":", 1)
+            return f"{head}://{user}:****@{rest}"
+        return f"{head}://****"
+    except Exception:
+        return "****"
+
 def db_init():
     """Create connection pool and ensure table exists; fall back to memory on failure."""
     global DB_ENABLED, POOL
     try:
-        POOL = SimpleConnectionPool(1, 5, DB_URL)
+        present = "yes" if DB_URL else "no"
+        print(Fore.CYAN + f"DB_URL present? {present} | {_mask_url(DB_URL)}")
+
+        # Force SSL even if not in the URL (harmless when present)
+        POOL = SimpleConnectionPool(1, 5, DB_URL, sslmode="require")
+
         conn = POOL.getconn()
         cur = conn.cursor()
         cur.execute("""
@@ -77,10 +96,13 @@ def db_init():
         cur.close()
         POOL.putconn(conn)
         DB_ENABLED = True
+        STATE["last_error"] = ""
         print(Fore.GREEN + "✅ Neon DB connected.")
     except Exception as e:
         DB_ENABLED = False
-        print(Fore.YELLOW + f"⚠️  Neon DB unavailable, using in-memory ledger. Reason: {e}")
+        msg = f"DB connect failed: {e}"
+        STATE["last_error"] = msg
+        print(Fore.YELLOW + f"⚠️  {msg}\nUsing in-memory ledger.")
 
 def db_save_trade(symbol, qty, entry, exitp, gross, net, reason):
     if DB_ENABLED and POOL:
@@ -145,7 +167,6 @@ def get_price_nse():
     """Try NSE live via nsepython."""
     try:
         data = nse_eq(SYMBOL)
-        # nsepython can sometimes return strings like '452.35'
         val = data.get("lastPrice")
         if val is None:
             return None
@@ -155,14 +176,12 @@ def get_price_nse():
 
 def get_price_yf():
     """Fallback: Yahoo Finance (near-real-time, often 1-2 min delay)."""
-    global _last_yf_ts
+    global _last_yf_ts, _last_cached_price
     try:
-        # throttle to 10s to avoid hammering
         now = time.time()
         if now - _last_yf_ts < 10 and _last_cached_price is not None:
             return _last_cached_price
         _last_yf_ts = now
-
         df = yf.download(YF_TICKER, period="1d", interval="1m", progress=False, auto_adjust=True)
         if df is None or df.empty:
             return None
@@ -183,7 +202,7 @@ def get_live_price():
 
 # ================== STRATEGY ==================
 def zerodha_fees(buy_value, sell_value):
-    # Simple model you used earlier
+    # Simple flat model
     return float(BROKERAGE + TAXES)
 
 def calc_indicators(closes):
@@ -201,7 +220,6 @@ def calc_indicators(closes):
     sd = df["Close"].rolling(20).std()
     df["BB_Mid"], df["BB_Up"], df["BB_Lo"] = ma, ma + 2*sd, ma - 2*sd
 
-    # Fill missing for early bars
     df.fillna(method="bfill", inplace=True)
     df.fillna(method="ffill", inplace=True)
     return df.iloc[-1]
@@ -411,7 +429,7 @@ async function refresh() {{
     document.getElementById('score').textContent = s.score.toFixed(2);
     document.getElementById('bars').textContent = s.bars_collected;
     document.getElementById('daily').innerHTML = (s.daily_profit >= 0 ? '<span class="gain">₹'+s.daily_profit.toFixed(2)+'</span>' : '<span class="loss">₹'+s.daily_profit.toFixed(2)+'</span>');
-    document.getElementById('total').innerHTML = (s.total_profit >= 0 ? '<span class="gain">₹'+s.total_profit.toFixed(2)+'</span>' : '<span class="loss">₹'+s.total_profit.toFixed(2)+'</span>');
+    document.getElementById('total').innerHTML = (s.db_enabled ? (s.total_profit >= 0 ? '<span class="gain">₹'+s.total_profit.toFixed(2)+'</span>' : '<span class="loss">₹'+s.total_profit.toFixed(2)+'</span>') : '<span class="loss">—</span>');
     document.getElementById('db').textContent = s.db_enabled ? '✅ Connected' : '⚠️ Memory mode';
 
     const pos = s.position;
@@ -448,5 +466,5 @@ if __name__ == "__main__":
     # start trading bot in background
     Thread(target=trading_bot, daemon=True).start()
     # run flask (Railway uses PORT env)
-    port = int(os.getenv("PORT", "5000"))
+    port = int(os.getenv("PORT", "8080"))  # gunicorn typically binds 8080 on Railway
     app.run(host="0.0.0.0", port=port)
