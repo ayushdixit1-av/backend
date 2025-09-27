@@ -1,533 +1,452 @@
-# app.py
-"""
-Robust Farm Marketplace single-file Flask app.
-This version checks information_schema for column existence and
-only runs index creation / JOINs / queries when columns are present.
-WARNING: Neon DSN is embedded here for convenience as requested.
-"""
-
 import os
-import re
-import uuid
-import logging
-from functools import wraps
-from datetime import datetime
-from typing import Optional
+import time
+import math
+import pandas as pd
+import numpy as np
+from datetime import datetime, date
+from threading import Thread
+from flask import Flask, jsonify, Response
+from colorama import Fore, Style, init
 
-from flask import (
-    Flask, request, session, redirect, url_for, jsonify,
-    render_template_string, flash, send_from_directory
-)
-from werkzeug.utils import secure_filename
+# Data sources
+from nsepython import nse_eq
+import yfinance as yf
+
+# DB
 import psycopg2
-from psycopg2 import pool, DatabaseError as Psycopg2DBError
-from psycopg2.extras import DictCursor
-from flask_wtf import CSRFProtect
+from psycopg2.pool import SimpleConnectionPool
 
-# ----- Config -----
-app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret-change-me")
-PORT = int(os.environ.get("PORT", 3000))
-UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-ALLOWED_IMAGES = {"png", "jpg", "jpeg", "gif"}
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
-csrf = CSRFProtect(app)
+# ================== CONFIG ==================
+init(autoreset=True)
 
-# Embedded Neon DSN (replace with env var in production)
-NEON_DSN = "postgresql://neondb_owner:npg_jgROvpDtrm03@ep-hidden-truth-aev5l7a7-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+SYMBOL = "ITC"         # NSE symbol
+YF_TICKER = "ITC.NS"   # Yahoo Finance ticker
+CAPITAL = 5000         # fake per-trade capital
+STOP_PCT = 0.002       # -0.2%
+TARGET_PCT = 0.006     # +0.6%
+TICK_INTERVAL = 3      # seconds between polls
+BROKERAGE = 40         # Zerodha approx fixed (buy+sell)
+TAXES = 9              # approx others combined
+SCORE_ENTRY = 0.30     # min score to enter long
+MIN_BARS_FOR_INDICATORS = 60
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("app")
+# Neon Postgres (set DB_URL env var on Railway)
+DB_URL = os.getenv(
+    "DB_URL",
+    "postgresql://neondb_owner:npg_jgROvpDtrm03@ep-hidden-truth-aev5l7a7-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require"
+)
 
-# ----- DB pool -----
-try:
-    pg_pool = psycopg2.pool.SimpleConnectionPool(minconn=1, maxconn=20, dsn=NEON_DSN, cursor_factory=DictCursor)
-    logger.info("Postgres pool created successfully.")
-except Exception as e:
-    logger.exception("Failed to create Postgres pool: %s", e)
-    raise
+# ================== GLOBAL STATE ==================
+STATE = {
+    "live_price": None,
+    "position": None,         # dict or None
+    "daily_profit": 0.0,
+    "total_profit": 0.0,
+    "last_error": "",
+    "last_signal": "HOLD",
+    "last_score": 0.0,
+    "bars_collected": 0
+}
+MEM_TRADES = []  # in-memory ledger if DB not available
 
-def get_conn():
-    return pg_pool.getconn()
+# ================== DB SETUP ==================
+DB_ENABLED = False
+POOL = None
 
-def put_conn(conn):
-    if conn:
-        pg_pool.putconn(conn)
-
-class DBError(Exception):
-    pass
-
-def db_fetchall(query: str, params: Optional[tuple] = None):
-    conn = None; cur = None
+def db_init():
+    """Create connection pool and ensure table exists; fall back to memory on failure."""
+    global DB_ENABLED, POOL
     try:
-        conn = get_conn()
+        POOL = SimpleConnectionPool(1, 5, DB_URL)
+        conn = POOL.getconn()
         cur = conn.cursor()
-        cur.execute(query, params or ())
-        rows = cur.fetchall()
-        cur.close()
-        return [dict(r) for r in rows] if rows else []
-    except Psycopg2DBError as e:
-        logger.error("db_fetchall error: %s | SQL: %s | params: %s", e, query, params)
-        if cur:
-            try: cur.close()
-            except: pass
-        raise DBError(str(e))
-    finally:
-        if conn:
-            put_conn(conn)
-
-def db_fetchone(query: str, params: Optional[tuple] = None):
-    conn = None; cur = None
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(query, params or ())
-        row = cur.fetchone()
-        cur.close()
-        return dict(row) if row else None
-    except Psycopg2DBError as e:
-        logger.error("db_fetchone error: %s | SQL: %s | params: %s", e, query, params)
-        if cur:
-            try: cur.close()
-            except: pass
-        raise DBError(str(e))
-    finally:
-        if conn:
-            put_conn(conn)
-
-def db_commit(query: str, params: Optional[tuple] = None, returning: bool = False):
-    conn = None; cur = None
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(query, params or ())
-        rv = None
-        if returning:
-            maybe = cur.fetchone()
-            if maybe:
-                try:
-                    rv = list(maybe.values())[0] if hasattr(maybe, "keys") else maybe[0]
-                except Exception:
-                    rv = maybe[0] if maybe else None
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id SERIAL PRIMARY KEY,
+            time TIMESTAMP DEFAULT NOW(),
+            symbol TEXT,
+            qty INTEGER,
+            entry FLOAT,
+            exit FLOAT,
+            gross FLOAT,
+            net FLOAT,
+            reason TEXT
+        );
+        """)
         conn.commit()
         cur.close()
-        return rv if returning else True
-    except Psycopg2DBError as e:
-        logger.error("db_commit error: %s | SQL: %s | params: %s", e, query, params)
-        try:
-            if conn: conn.rollback()
-        except:
-            pass
-        if cur:
-            try: cur.close()
-            except: pass
-        raise DBError(str(e))
-    finally:
-        if conn:
-            put_conn(conn)
+        POOL.putconn(conn)
+        DB_ENABLED = True
+        print(Fore.GREEN + "✅ Neon DB connected.")
+    except Exception as e:
+        DB_ENABLED = False
+        print(Fore.YELLOW + f"⚠️  Neon DB unavailable, using in-memory ledger. Reason: {e}")
 
-# ----- Schema/column helpers -----
-def column_exists(table: str, column: str) -> bool:
-    """Check information_schema for column existence. Safe and avoids exceptions."""
+def db_save_trade(symbol, qty, entry, exitp, gross, net, reason):
+    if DB_ENABLED and POOL:
+        try:
+            conn = POOL.getconn()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO trades(symbol, qty, entry, exit, gross, net, reason)
+                VALUES (%s,%s,%s,%s,%s,%s,%s);
+            """, (symbol, qty, entry, exitp, gross, net, reason))
+            conn.commit()
+            cur.close()
+            POOL.putconn(conn)
+            return
+        except Exception as e:
+            print(Fore.YELLOW + f"⚠️  DB insert failed, falling back to memory. Reason: {e}")
+
+    # Fallback: memory
+    MEM_TRADES.append({
+        "time": datetime.now(),
+        "symbol": symbol,
+        "qty": qty,
+        "entry": float(entry),
+        "exit": float(exitp),
+        "gross": float(gross),
+        "net": float(net),
+        "reason": reason
+    })
+
+def db_get_trades():
+    if DB_ENABLED and POOL:
+        try:
+            conn = POOL.getconn()
+            df = pd.read_sql("SELECT * FROM trades ORDER BY time DESC", conn)
+            POOL.putconn(conn)
+            return df
+        except Exception as e:
+            print(Fore.YELLOW + f"⚠️  DB read failed, using memory. Reason: {e}")
+    # memory fallback
+    if not MEM_TRADES:
+        return pd.DataFrame(columns=["time","symbol","qty","entry","exit","gross","net","reason"])
+    return pd.DataFrame(MEM_TRADES)
+
+def db_total_profit():
+    if DB_ENABLED and POOL:
+        try:
+            conn = POOL.getconn()
+            cur = conn.cursor()
+            cur.execute("SELECT COALESCE(SUM(net),0) FROM trades;")
+            total = cur.fetchone()[0]
+            POOL.putconn(conn)
+            return float(total or 0)
+        except Exception as e:
+            print(Fore.YELLOW + f"⚠️  DB sum failed, using memory. Reason: {e}")
+    return float(sum(t["net"] for t in MEM_TRADES))
+
+# ================== PRICE FETCHER ==================
+_last_cached_price = None
+_last_yf_ts = 0.0
+
+def get_price_nse():
+    """Try NSE live via nsepython."""
     try:
-        r = db_fetchone("""
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = %s AND column_name = %s
-        """, (table, column))
-        return bool(r)
-    except DBError as e:
-        logger.error("column_exists check failed: %s", e)
-        return False
-
-def ensure_tables_and_columns():
-    """Create missing tables, then add missing columns (if any), then create indexes only when safe."""
-    # 1) Create basic tables if not exist (minimal columns)
-    base_stmts = [
-        """CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT, role TEXT DEFAULT 'buyer', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );""",
-        """CREATE TABLE IF NOT EXISTS products (
-            id SERIAL PRIMARY KEY, name TEXT, price NUMERIC(12,2), quantity INTEGER DEFAULT 0, description TEXT, status TEXT DEFAULT 'active', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );""",
-        """CREATE TABLE IF NOT EXISTS product_images (
-            id SERIAL PRIMARY KEY, product_id INTEGER, filename TEXT
-        );""",
-        """CREATE TABLE IF NOT EXISTS orders (
-            id SERIAL PRIMARY KEY, total_amount NUMERIC(12,2) DEFAULT 0, status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );""",
-        """CREATE TABLE IF NOT EXISTS order_items (
-            id SERIAL PRIMARY KEY, order_id INTEGER, product_id INTEGER, quantity INTEGER, price NUMERIC(12,2)
-        );""",
-        """CREATE TABLE IF NOT EXISTS reviews (
-            id SERIAL PRIMARY KEY, buyer_id INTEGER, farmer_id INTEGER, product_id INTEGER, rating INTEGER, comment TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );"""
-    ]
-    for s in base_stmts:
-        try:
-            db_commit(s)
-        except DBError as e:
-            logger.error("Base create failed: %s", e)
-
-    # 2) Ensure specific columns exist (ALTER TABLE ... ADD COLUMN IF NOT EXISTS)
-    alters = [
-        # products table expected columns
-        ("products","farmer_id","INTEGER"),
-        ("products","category","TEXT"),
-        ("products","unit","TEXT"),
-        ("products","location","TEXT"),
-        ("products","is_organic","BOOLEAN DEFAULT FALSE"),
-        # users table expected columns
-        ("users","location","TEXT"),
-        ("users","profile_image","TEXT"),
-        ("users","role","TEXT DEFAULT 'buyer'"),
-        # orders expected columns
-        ("orders","buyer_id","INTEGER"),
-        ("orders","farmer_id","INTEGER"),
-        ("orders","delivery_date","DATE"),
-        ("orders","address","TEXT"),
-        ("orders","updated_at","TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
-        # product_images
-        ("product_images","product_id","INTEGER"),
-        ("product_images","filename","TEXT")
-    ]
-    for table, col, definition in alters:
-        try:
-            # Use ALTER TABLE ADD COLUMN IF NOT EXISTS
-            db_commit(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {definition};")
-        except DBError as e:
-            logger.error("Alter failed for %s.%s : %s", table, col, e)
-
-    # 3) Create indexes only if columns now exist
-    idxs = [
-        ("products","category","CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);"),
-        ("products","farmer_id","CREATE INDEX IF NOT EXISTS idx_products_farmer ON products(farmer_id);"),
-        ("orders","buyer_id","CREATE INDEX IF NOT EXISTS idx_orders_buyer ON orders(buyer_id);")
-    ]
-    for table, col, stmt in idxs:
-        if column_exists(table, col):
-            try:
-                db_commit(stmt)
-            except DBError as e:
-                logger.error("Index create failed: %s | %s", stmt, e)
-        else:
-            logger.info("Skipping index create: column %s.%s missing", table, col)
-
-ensure_tables_and_columns()
-
-# ----- Small helpers -----
-EMAIL_RE = re.compile(r"^[^@]+@gmail\.com$")
-def is_gmail(email: str) -> bool:
-    return bool(email and EMAIL_RE.match(email.strip().lower()))
-
-def allowed_file(filename: str) -> bool:
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_IMAGES
-
-def save_image(file_storage):
-    if not file_storage or file_storage.filename == "":
+        data = nse_eq(SYMBOL)
+        # nsepython can sometimes return strings like '452.35'
+        val = data.get("lastPrice")
+        if val is None:
+            return None
+        return float(val)
+    except Exception:
         return None
-    if not allowed_file(file_storage.filename):
+
+def get_price_yf():
+    """Fallback: Yahoo Finance (near-real-time, often 1-2 min delay)."""
+    global _last_yf_ts
+    try:
+        # throttle to 10s to avoid hammering
+        now = time.time()
+        if now - _last_yf_ts < 10 and _last_cached_price is not None:
+            return _last_cached_price
+        _last_yf_ts = now
+
+        df = yf.download(YF_TICKER, period="1d", interval="1m", progress=False, auto_adjust=True)
+        if df is None or df.empty:
+            return None
+        price = float(df["Close"].dropna().iloc[-1])
+        return price
+    except Exception:
         return None
-    fname = secure_filename(file_storage.filename)
-    unique = f"{uuid.uuid4().hex}_{fname}"
-    dest = os.path.join(UPLOAD_DIR, unique)
-    file_storage.save(dest)
-    return unique
 
-# Safe sort mapping
-SORT_WHITELIST = {
-    "newest": "p.created_at DESC",
-    "price_asc": "p.price ASC",
-    "price_desc": "p.price DESC"
-}
-DEFAULT_SORT_SQL = SORT_WHITELIST["newest"]
+def get_live_price():
+    """Robust fetcher: NSE -> Yahoo -> last cached."""
+    global _last_cached_price
+    p = get_price_nse()
+    if p is None:
+        p = get_price_yf()
+    if p is not None:
+        _last_cached_price = p
+    return _last_cached_price
 
-# ----- Error handlers -----
-@app.errorhandler(DBError)
-def handle_db_error(e):
-    logger.error("Database error (handled): %s", e)
-    return render_template_string("<h1>Database error</h1><p>Please try again later.</p>"), 500
+# ================== STRATEGY ==================
+def zerodha_fees(buy_value, sell_value):
+    # Simple model you used earlier
+    return float(BROKERAGE + TAXES)
 
-# ----- Minimal single-file templates -----
-BASE_HTML = """
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{title or 'Farm Marketplace'}}</title>
-<style>
-:root{--green:#2f8f3a;--bg:#f4faf6;--card:#fff;--muted:#64748b}
-body{font-family:Arial,Helvetica,sans-serif;margin:0;background:var(--bg);color:#0f172a}
-.top{background:var(--card);padding:12px 20px;border-bottom:1px solid #e6eef2;display:flex;justify-content:space-between}
-.brand{font-weight:700;color:var(--green)}
-.container{max-width:1100px;margin:18px auto;padding:0 12px}
-.card{background:var(--card);padding:16px;border-radius:8px;border:1px solid #e6eef2;margin-bottom:12px}
-.btn{background:var(--green);color:#fff;padding:8px 12px;border-radius:8px;border:none;cursor:pointer}
-.small{color:var(--muted);font-size:0.95rem}
-.listing-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
-img.product{width:100%;height:150px;object-fit:cover;border-radius:8px}
-.notice{background:#fff3cd;padding:8px;border-radius:8px;border:1px solid #ffeeba;margin-bottom:12px}
-</style></head><body>
-<div class="top"><div class="brand">🚜 Farm Marketplace</div><div>
-{% if session.get('user_id') %}
-  <span class="small">{{session.get('user_email')}}</span> <a href="{{url_for('logout')}}" class="btn">Logout</a>
-{% else %}
-  <a href="{{url_for('login')}}" class="btn">Sign in (mock Gmail)</a>
-{% endif %}
-</div></div>
-<div class="container">
-{% with messages = get_flashed_messages() %}
-  {% if messages %}
-    <div class="card">{% for m in messages %}<div class="notice">{{m}}</div>{% endfor %}</div>
-  {% endif %}
-{% endwith %}
-{{body|safe}}
-</div></body></html>
-"""
+def calc_indicators(closes):
+    df = pd.DataFrame(closes, columns=["Close"])
+    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
+    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
 
-# ----- Routes -----
-@app.route("/login", methods=["GET","POST"])
-def login():
-    if request.method == "POST":
-        email = (request.form.get("email") or "").strip().lower()
-        name = (request.form.get("name") or "").strip()
-        role = (request.form.get("role") or "buyer")
-        if not is_gmail(email):
-            flash("Please use a Gmail address (for production integrate Google OAuth).")
-            return redirect(url_for("login"))
+    delta = df["Close"].diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    rs = (up.rolling(14).mean() / down.rolling(14).mean()).replace([np.inf, -np.inf], np.nan)
+    df["RSI14"] = 100 - (100 / (1 + rs))
+
+    ma = df["Close"].rolling(20).mean()
+    sd = df["Close"].rolling(20).std()
+    df["BB_Mid"], df["BB_Up"], df["BB_Lo"] = ma, ma + 2*sd, ma - 2*sd
+
+    # Fill missing for early bars
+    df.fillna(method="bfill", inplace=True)
+    df.fillna(method="ffill", inplace=True)
+    return df.iloc[-1]
+
+def decide_signal(row):
+    votes = [
+        1 if row["EMA20"] > row["EMA50"] else -1,
+        1 if row["RSI14"] < 30 else -1 if row["RSI14"] > 70 else 0,
+        1 if row["Close"] > row["BB_Mid"] else -1 if row["Close"] < row["BB_Mid"] else 0,
+    ]
+    score = float(np.mean(votes))
+    if score > 0.25:
+        return "BUY", score
+    elif score < -0.25:
+        return "SELL", score
+    else:
+        return "HOLD", score
+
+# ================== TRADING BOT LOOP ==================
+def trading_bot():
+    print(Fore.CYAN + "\n🚀 Starting ITC Live Algo (Neon + Flask)")
+    print(Fore.YELLOW + "=" * 80)
+
+    db_init()
+
+    position = None
+    closes = []
+    STATE["bars_collected"] = 0
+
+    while True:
         try:
-            user = db_fetchone("SELECT * FROM users WHERE email=%s", (email,))
-            if not user:
-                uid = db_commit("INSERT INTO users (email,name,role) VALUES (%s,%s,%s) RETURNING id", (email, name or None, role), returning=True)
-                user = db_fetchone("SELECT * FROM users WHERE id=%s", (uid,))
-            session['user_id'] = user['id']; session['user_email'] = user['email']; session['role'] = user.get('role') or 'buyer'
-            flash("Signed in (mock).")
-            return redirect(url_for('index'))
-        except DBError as e:
-            logger.error("Login DBError: %s", e)
-            flash("Database error.")
-            return redirect(url_for('login'))
-    body = """
-    <div class="card"><h2>Sign in (Gmail-only mock)</h2>
-      <form method="post">
-        <div><label>Email</label><br><input name="email" required></div>
-        <div><label>Name</label><br><input name="name"></div>
-        <div><label>Role</label><br><select name="role"><option value="buyer">Buyer</option><option value="farmer">Farmer</option><option value="admin">Admin</option></select></div>
-        <div style="margin-top:8px"><button class="btn">Sign in</button></div>
-      </form>
-    </div>
-    """
-    return render_template_string(BASE_HTML, body=body, title="Sign in")
+            price = get_live_price()
+            if price is None:
+                STATE["last_error"] = "Price unavailable (both sources)."
+                print(Fore.RED + "⚠️  Price unavailable. Retrying...")
+                time.sleep(TICK_INTERVAL)
+                continue
 
-@app.route("/logout")
-def logout():
-    session.clear(); flash("Logged out."); return redirect(url_for('index'))
+            STATE["live_price"] = float(price)
+            closes.append(float(price))
+            if len(closes) > 2000:
+                closes = closes[-1000:]  # keep memory small
+
+            if len(closes) < MIN_BARS_FOR_INDICATORS:
+                STATE["bars_collected"] = len(closes)
+                time.sleep(TICK_INTERVAL)
+                continue
+
+            row = calc_indicators(closes[-MIN_BARS_FOR_INDICATORS:])
+            signal, score = decide_signal(row)
+            STATE["last_signal"] = signal
+            STATE["last_score"] = score
+            STATE["bars_collected"] = len(closes)
+
+            # ENTRY (long-only)
+            if not position and signal == "BUY" and score >= SCORE_ENTRY:
+                qty = int(CAPITAL // price)
+                if qty >= 1:
+                    position = {
+                        "entry": price,
+                        "qty": qty,
+                        "sl": price * (1 - STOP_PCT),
+                        "tp": price * (1 + TARGET_PCT),
+                        "time": datetime.now()
+                    }
+                    STATE["position"] = {
+                        "qty": qty, "entry": float(price),
+                        "sl": float(position["sl"]), "tp": float(position["tp"]),
+                        "since": position["time"].strftime("%H:%M:%S")
+                    }
+                    print(Fore.GREEN + f"🟢 ENTRY: BUY {qty} @ ₹{price:.2f} | SL ₹{position['sl']:.2f} | TP ₹{position['tp']:.2f}")
+                else:
+                    print(Fore.YELLOW + "ℹ️  Not enough capital to buy 1 share at current price.")
+
+            # EXIT (SL/TP)
+            elif position:
+                exit_reason = None
+                if price <= position["sl"]:
+                    exit_reason = "SL HIT"
+                elif price >= position["tp"]:
+                    exit_reason = "TP HIT"
+
+                if exit_reason:
+                    buy_val = position["entry"] * position["qty"]
+                    sell_val = price * position["qty"]
+                    gross = sell_val - buy_val
+                    fees = zerodha_fees(buy_val, sell_val)
+                    net = gross - fees
+
+                    # Update state profits
+                    STATE["daily_profit"] = float(STATE["daily_profit"] + net)
+                    total = db_total_profit()
+                    STATE["total_profit"] = float(total + net)
+
+                    # Save trade
+                    db_save_trade(SYMBOL, position["qty"], position["entry"], price, gross, net, exit_reason)
+
+                    print((Fore.RED if net < 0 else Fore.GREEN) + f"🔚 EXIT: {exit_reason} @ ₹{price:.2f} | Net ₹{net:.2f} (gross {gross:.2f}, fees {fees:.2f})")
+                    position = None
+                    STATE["position"] = None
+
+            # Status line
+            total_in_db = db_total_profit()
+            STATE["total_profit"] = float(total_in_db)
+            print(
+                Fore.WHITE + f"⏰ {datetime.now().strftime('%H:%M:%S')} | "
+                f"💰 Price ₹{price:.2f} | "
+                f"Signal {STATE['last_signal']} ({STATE['last_score']:.2f}) | "
+                f"Bars {STATE['bars_collected']} | "
+                + (Fore.GREEN + f"Holding {STATE['position']['qty']}" if STATE['position'] else Fore.YELLOW + "No position")
+            )
+            print(Fore.MAGENTA + f"🏦 Daily: ₹{STATE['daily_profit']:.2f} | 📊 Total(Neon): ₹{STATE['total_profit']:.2f}")
+            print(Fore.CYAN + "-" * 80)
+
+            time.sleep(TICK_INTERVAL)
+
+        except Exception as e:
+            STATE["last_error"] = f"Loop error: {e}"
+            print(Fore.RED + f"❌ Loop error: {e}")
+            time.sleep(TICK_INTERVAL)
+
+# ================== FLASK APP ==================
+app = Flask(__name__)
+
+@app.route("/api/status")
+def api_status():
+    # compose a safe status payload
+    safe_pos = STATE["position"] if STATE["position"] else None
+    return jsonify({
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "price": STATE["live_price"],
+        "signal": STATE["last_signal"],
+        "score": round(float(STATE["last_score"]), 3),
+        "daily_profit": round(float(STATE["daily_profit"]), 2),
+        "total_profit": round(float(STATE["total_profit"]), 2),
+        "bars_collected": STATE["bars_collected"],
+        "position": safe_pos,
+        "error": STATE["last_error"],
+        "db_enabled": DB_ENABLED,
+    })
+
+@app.route("/api/trades")
+def api_trades():
+    df = db_get_trades()
+    if not df.empty and not isinstance(df.iloc[0]["time"], str):
+        df["time"] = df["time"].astype(str)
+    return jsonify(df.to_dict(orient="records"))
 
 @app.route("/")
-def index():
-    # Build safe featured products query: do not reference farmer_id if it doesn't exist
-    try:
-        # If farmer_id exists, left join to users table for farmer name
-        if column_exists("products", "farmer_id") and column_exists("users", "name"):
-            sql = "SELECT p.id, p.name, COALESCE(p.price,0) AS price, COALESCE(p.quantity,0) AS quantity, u.name AS farmer_name FROM products p LEFT JOIN users u ON p.farmer_id = u.id WHERE p.status='active' ORDER BY p.created_at DESC LIMIT 6"
-        else:
-            sql = "SELECT p.id, p.name, COALESCE(p.price,0) AS price, COALESCE(p.quantity,0) AS quantity FROM products p WHERE p.status='active' ORDER BY p.created_at DESC LIMIT 6"
-        prods = db_fetchall(sql) or []
-    except DBError as e:
-        logger.error("Homepage fetch failed: %s", e)
-        prods = []
-    cards = ""
-    for p in prods:
-        img = None
-        try:
-            img_row = db_fetchone("SELECT filename FROM product_images WHERE product_id=%s ORDER BY id LIMIT 1", (p['id'],))
-            img = img_row['filename'] if img_row else None
-        except DBError:
-            img = None
-        img_url = url_for('uploaded_file', filename=img) if img else "https://via.placeholder.com/400x300?text=No+image"
-        farmer_html = f"<div class='small'>By {p.get('farmer_name')}</div>" if p.get('farmer_name') else ""
-        cards += f"""<div class="card"><img class="product" src="{img_url}"><h3>{p['name']}</h3>{farmer_html}<div class="small">₹{float(p['price']):.2f} • Stock {p['quantity']}</div></div>"""
-    body = f"<div class='card'><h2>Featured</h2><div class='listing-grid'>{cards}</div></div>"
-    return render_template_string(BASE_HTML, body=body, title="Home")
+def dashboard():
+    # Minimal HTML with JS polling (no templates required)
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>🚀 ITC Algo Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    body {{ background:#0b0b0b; color:#eee; font-family:Arial, sans-serif; margin:0; padding:20px; }}
+    h1 {{ color:#00ff9f; }}
+    .cards {{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:16px; }}
+    .card {{ background:#161616; border-radius:12px; padding:14px; box-shadow:0 0 0 1px #222; }}
+    .label {{ color:#aaa; font-size:12px; }}
+    .value {{ font-size:22px; margin-top:4px; }}
+    .gain {{ color:#00ff9f; }}
+    .loss {{ color:#ff5a5a; }}
+    table {{ width:100%; border-collapse:collapse; margin-top:12px; }}
+    th,td {{ border-bottom:1px solid #222; padding:8px; text-align:left; }}
+    th {{ color:#00ff9f; }}
+    .small {{ font-size:12px; color:#aaa; }}
+    @media (max-width:900px) {{ .cards {{ grid-template-columns:1fr 1fr; }} }}
+    @media (max-width:600px) {{ .cards {{ grid-template-columns:1fr; }} }}
+  </style>
+</head>
+<body>
+  <h1>🚀 ITC Live Algo — Neon + Flask</h1>
+  <div id="info" class="small">Loading...</div>
+  <div class="cards">
+    <div class="card"><div class="label">Live Price</div><div id="price" class="value">—</div></div>
+    <div class="card"><div class="label">Signal</div><div id="signal" class="value">—</div></div>
+    <div class="card"><div class="label">Score</div><div id="score" class="value">—</div></div>
+    <div class="card"><div class="label">Bars</div><div id="bars" class="value">—</div></div>
+    <div class="card"><div class="label">Daily Profit</div><div id="daily" class="value">—</div></div>
+    <div class="card"><div class="label">Total Profit (Neon)</div><div id="total" class="value">—</div></div>
+    <div class="card"><div class="label">Position</div><div id="pos" class="value small">—</div></div>
+    <div class="card"><div class="label">DB Status</div><div id="db" class="value small">—</div></div>
+  </div>
 
-@app.route("/uploads/<path:filename>")
-def uploaded_file(filename):
-    return send_from_directory(UPLOAD_DIR, filename)
+  <div class="card">
+    <div class="label">Trades</div>
+    <table id="table">
+      <thead><tr><th>Time</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Net</th><th>Reason</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
 
-@app.route("/market")
-def market():
-    q = (request.args.get('q') or "").strip()
-    category = (request.args.get('category') or "").strip()
-    location = (request.args.get('location') or "").strip()
-    organic = request.args.get('organic')
-    sort = request.args.get('sort') or 'newest'
-    sort_sql = SORT_WHITELIST.get(sort, DEFAULT_SORT_SQL)
+<script>
+async function refresh() {{
+  try {{
+    const s = await fetch('/api/status').then(r => r.json());
+    const t = await fetch('/api/trades').then(r => r.json());
 
-    params = []
-    # Build base SQL conditionally: include category/location columns only if they exist
-    select_fields = "p.id, p.name, COALESCE(p.price,0) as price, COALESCE(p.quantity,0) as quantity"
-    if column_exists("products", "category"):
-        select_fields += ", p.category"
-    if column_exists("products", "location"):
-        select_fields += ", p.location"
-    # join farmer name only if column exists
-    join_sql = ""
-    if column_exists("products","farmer_id") and column_exists("users","name"):
-        select_fields += ", u.name as farmer_name"
-        join_sql = " LEFT JOIN users u ON p.farmer_id = u.id"
+    document.getElementById('info').textContent = 'Last update: ' + s.time + (s.error ? ' | ⚠️ ' + s.error : '');
+    document.getElementById('price').textContent = s.price ? '₹' + s.price.toFixed(2) : 'Fetching...';
+    document.getElementById('signal').textContent = s.signal;
+    document.getElementById('score').textContent = s.score.toFixed(2);
+    document.getElementById('bars').textContent = s.bars_collected;
+    document.getElementById('daily').innerHTML = (s.daily_profit >= 0 ? '<span class="gain">₹'+s.daily_profit.toFixed(2)+'</span>' : '<span class="loss">₹'+s.daily_profit.toFixed(2)+'</span>');
+    document.getElementById('total').innerHTML = (s.total_profit >= 0 ? '<span class="gain">₹'+s.total_profit.toFixed(2)+'</span>' : '<span class="loss">₹'+s.total_profit.toFixed(2)+'</span>');
+    document.getElementById('db').textContent = s.db_enabled ? '✅ Connected' : '⚠️ Memory mode';
 
-    sql = f"SELECT {select_fields} FROM products p {join_sql} WHERE p.status='active'"
+    const pos = s.position;
+    document.getElementById('pos').textContent = pos ? ('LONG '+pos.qty+' @ ₹'+pos.entry.toFixed(2)+' | SL ₹'+pos.sl.toFixed(2)+' | TP ₹'+pos.tp.toFixed(2)+' | since '+pos.since) : 'No position';
 
-    if q:
-        sql += " AND (p.name ILIKE %s OR p.description ILIKE %s)"
-        params.extend([f"%{q}%", f"%{q}%"])
-    if category and column_exists("products","category"):
-        sql += " AND p.category = %s"; params.append(category)
-    if location and column_exists("products","location"):
-        sql += " AND p.location ILIKE %s"; params.append(f"%{location}%")
-    if organic and column_exists("products","is_organic"):
-        sql += " AND p.is_organic = TRUE"
+    const tbody = document.querySelector('#table tbody');
+    tbody.innerHTML = '';
+    for (const row of t) {{
+      const tr = document.createElement('tr');
+      const net = parseFloat(row.net);
+      tr.innerHTML = `
+        <td>${{row.time}}</td>
+        <td>${{row.qty}}</td>
+        <td>₹${{parseFloat(row.entry).toFixed(2)}}</td>
+        <td>₹${{parseFloat(row.exit).toFixed(2)}}</td>
+        <td class="${{net>=0?'gain':'loss'}}">₹${{net.toFixed(2)}}</td>
+        <td>${{row.reason}}</td>`;
+      tbody.appendChild(tr);
+    }}
+  }} catch (e) {{
+    document.getElementById('info').textContent = 'Error updating: ' + e;
+  }}
+}}
+setInterval(refresh, 5000);
+refresh();
+</script>
+</body>
+</html>
+"""
+    return Response(html, mimetype="text/html")
 
-    # safe ordering using whitelist
-    sql += f" ORDER BY {sort_sql} LIMIT 200"
-
-    try:
-        prods = db_fetchall(sql, tuple(params)) or []
-    except DBError as e:
-        logger.error("Market fetch failed: %s", e)
-        prods = []
-
-    cards = ""
-    for p in prods:
-        img = None
-        try:
-            img_row = db_fetchone("SELECT filename FROM product_images WHERE product_id=%s ORDER BY id LIMIT 1", (p['id'],))
-            img = img_row['filename'] if img_row else None
-        except DBError:
-            img = None
-        img_url = url_for('uploaded_file', filename=img) if img else "https://via.placeholder.com/400x300?text=No+image"
-        farmer_html = f"<div class='small'>By {p.get('farmer_name')}</div>" if p.get('farmer_name') else ""
-        cards += f"""<div class="card"><img class="product" src="{img_url}"><h3>{p['name']}</h3>{farmer_html}<div class="small">₹{float(p['price']):.2f} • Stock {p['quantity']}</div><div style="margin-top:8px"><a href="{url_for('product_view', product_id=p['id'])}">View</a></div></div>"""
-    body = f"""
-      <div class="card">
-        <form method="get" style="display:flex;gap:8px;flex-wrap:wrap">
-          <input name="q" placeholder="search" value="{q}">
-          <input name="location" placeholder="location" value="{location}">
-          <select name="category">
-            <option value="">All categories</option>
-            <option{" selected" if category=="Fresh Vegetables" else ""}>Fresh Vegetables</option>
-            <option{" selected" if category=="Fruits" else ""}>Fruits</option>
-            <option{" selected" if category=="Grains & Cereals" else ""}>Grains & Cereals</option>
-            <option{" selected" if category=="Dairy Products" else ""}>Dairy Products</option>
-            <option{" selected" if category=="Meat & Poultry" else ""}>Meat & Poultry</option>
-            <option{" selected" if category=="Organic Products" else ""}>Organic Products</option>
-            <option{" selected" if category=="Herbs & Spices" else ""}>Herbs & Spices</option>
-          </select>
-          <label class="small">Organic <input type="checkbox" name="organic" value="1" {"checked" if organic else ""}></label>
-          <select name="sort">
-            <option value="newest" {"selected" if sort=="newest" else ""}>Newest</option>
-            <option value="price_asc" {"selected" if sort=="price_asc" else ""}>Price low→high</option>
-            <option value="price_desc" {"selected" if sort=="price_desc" else ""}>Price high→low</option>
-          </select>
-          <button class="btn">Filter</button>
-        </form>
-      </div>
-      <div class="listing-grid">{cards}</div>
-    """
-    return render_template_string(BASE_HTML, body=body, title="Marketplace")
-
-@app.route("/product/<int:product_id>")
-def product_view(product_id):
-    try:
-        p = db_fetchone("SELECT id,name,price,quantity,description FROM products WHERE id=%s", (product_id,))
-    except DBError:
-        flash("Product lookup failed.")
-        return redirect(url_for('market'))
-    if not p:
-        flash("Product not found.")
-        return redirect(url_for('market'))
-    imgs = db_fetchall("SELECT filename FROM product_images WHERE product_id=%s ORDER BY id", (product_id,)) or []
-    imgs_html = "".join([f'<img src="{url_for("uploaded_file", filename=i["filename"])}" style="max-width:200px;margin-right:6px">' for i in imgs])
-    body = f"""
-      <div class="card">
-        <div style="display:flex;gap:10px">
-          <div style="min-width:260px">{imgs_html or '<div class=small>No images</div>'}</div>
-          <div>
-            <h2>{p['name']}</h2>
-            <div class="small">Price: ₹{float(p['price']):.2f}</div>
-            <p class="small">{p.get('description') or ''}</p>
-          </div>
-        </div>
-      </div>
-    """
-    return render_template_string(BASE_HTML, body=body, title=p['name'])
-
-# Minimal farmer routes (create product) with defensive DB usage
-def role_required(required_role):
-    def deco(f):
-        @wraps(f)
-        def wrapper(*args, **kwargs):
-            if not session.get('user_id'):
-                flash("Please sign in."); return redirect(url_for('login'))
-            if session.get('role') != required_role:
-                flash("Access denied."); return redirect(url_for('index'))
-            return f(*args, **kwargs)
-        return wrapper
-    return deco
-
-@app.route("/farmer", methods=["GET","POST"])
-@role_required('farmer')
-def farmer_dashboard():
-    if request.method == "POST":
-        try:
-            name = request.form.get('name')
-            price = float(request.form.get('price') or 0)
-            quantity = int(request.form.get('quantity') or 0)
-            category = request.form.get('category') if column_exists("products","category") else None
-            description = request.form.get('description')
-            farmer_id = session['user_id'] if column_exists("products","farmer_id") else None
-            pid = db_commit("INSERT INTO products (name,price,quantity,category,description,farmer_id) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
-                            (name, price, quantity, category, description, farmer_id), returning=True)
-            files = request.files.getlist('images')
-            for f in files:
-                saved = save_image(f)
-                if saved:
-                    db_commit("INSERT INTO product_images (product_id,filename) VALUES (%s,%s)", (pid, saved))
-            flash("Product created.")
-        except DBError as e:
-            logger.error("Create product failed: %s", e)
-            flash("Failed to create product.")
-        return redirect(url_for('farmer_dashboard'))
-    try:
-        if column_exists("products","farmer_id"):
-            products = db_fetchall("SELECT id,name,price,quantity FROM products WHERE farmer_id=%s ORDER BY created_at DESC", (session['user_id'],)) or []
-        else:
-            products = db_fetchall("SELECT id,name,price,quantity FROM products ORDER BY created_at DESC LIMIT 50") or []
-    except DBError:
-        products = []
-    rows = "".join([f"<div class='list-item'><div><strong>{p['name']}</strong><div class='small'>₹{float(p['price']):.2f} • {p['quantity']}</div></div></div>" for p in products])
-    body = f"""
-      <div class="card"><h2>Create product</h2>
-        <form method="post" enctype="multipart/form-data">
-          <div><input name="name" placeholder="Product name" required></div>
-          <div><input name="price" placeholder="Price"></div>
-          <div><input name="quantity" placeholder="Quantity"></div>
-          <div><input name="category" placeholder="Category"></div>
-          <div><textarea name="description" placeholder="Description"></textarea></div>
-          <div><input type="file" name="images" multiple></div>
-          <div style="margin-top:8px"><button class="btn">Create</button></div>
-        </form>
-      </div>
-      <div class="card"><h3>Your products</h3>{rows or '<div class=small>No products yet</div>'}</div>
-    """
-    return render_template_string(BASE_HTML, body=body, title="Farmer")
-
-@app.route("/health")
-def health():
-    try:
-        ok = db_fetchone("SELECT 1 as ok")
-        return jsonify({"status":"ok" if ok else "db-error", "time": datetime.utcnow().isoformat()})
-    except DBError:
-        return jsonify({"status":"db-error","time": datetime.utcnow().isoformat()}), 500
-
+# ================== RUN BOTH ==================
 if __name__ == "__main__":
-    logger.info("Starting app on port %s", PORT)
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    # start trading bot in background
+    Thread(target=trading_bot, daemon=True).start()
+    # run flask (Railway uses PORT env)
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
